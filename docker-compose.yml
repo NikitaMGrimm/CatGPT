@@ -39,8 +39,14 @@ services:
       - DISPLAY_HEIGHT=768
       - DISPLAY_DEPTH=24
 
+      # Provider: "chatgpt" or "claude"
+      - PROVIDER=chatgpt
+
       # ChatGPT
       - CHATGPT_URL=https://chatgpt.com
+
+      # Claude
+      - CLAUDE_URL=https://claude.ai
 
       # Timeouts
       - RESPONSE_TIMEOUT=120000

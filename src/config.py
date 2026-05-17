@@ -38,6 +38,17 @@ class Config:
     HEADLESS: bool = os.getenv("HEADLESS", "false").lower() == "true"
     SLOW_MO: int = int(os.getenv("SLOW_MO", "50"))
     CHATGPT_URL: str = os.getenv("CHATGPT_URL", "https://chatgpt.com")
+    CLAUDE_URL: str = os.getenv("CLAUDE_URL", "https://claude.ai")
+
+    # Provider selection: "chatgpt" or "claude"
+    PROVIDER: str = os.getenv("PROVIDER", "chatgpt").lower()
+
+    @classmethod
+    def provider_url(cls) -> str:
+        """Return the target URL for the active provider."""
+        if cls.PROVIDER == "claude":
+            return cls.CLAUDE_URL
+        return cls.CHATGPT_URL
 
     # Timeouts (ms)
     RESPONSE_TIMEOUT: int = int(os.getenv("RESPONSE_TIMEOUT", "120000"))

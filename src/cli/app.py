@@ -44,6 +44,7 @@ suppress_console_logs()
 
 from src.browser.manager import BrowserManager
 from src.chatgpt.client import ChatGPTClient
+from src.claude.client import ClaudeClient
 from src.chatgpt.models import ChatResponse, ImageInfo
 from src.config import Config
 from src.log import setup_logging
@@ -241,7 +242,7 @@ class ChatScreen(Screen):
     def __init__(self) -> None:
         super().__init__()
         self.browser: BrowserManager | None = None
-        self.client: ChatGPTClient | None = None
+        self.client: ChatGPTClient | ClaudeClient | None = None
         self.connected: bool = False
         self.thread_id: str = ""
         self.msg_count: int = 0
@@ -275,7 +276,7 @@ class ChatScreen(Screen):
         with Vertical(id="chat-container"):
             with ScrollableContainer(id="chat-log"):
                 yield Static(
-                    "\u25cf  Connecting to ChatGPT \u2026", classes="system-msg"
+                    "\u25cf  Connecting \u2026", classes="system-msg"
                 )
         yield Input(
             placeholder="Message CATGPT \u2026  (/help for commands)",
@@ -301,12 +302,14 @@ class ChatScreen(Screen):
     def _connect(self) -> None:
         """Launch browser and connect to ChatGPT in a background thread."""
 
-        async def _do_connect() -> tuple[BrowserManager, ChatGPTClient, str]:
+        async def _do_connect() -> tuple[BrowserManager, ChatGPTClient | ClaudeClient, str]:
             from src.browser.auto_login import ensure_logged_in
 
             browser = BrowserManager()
             page = await browser.start()
-            await browser.navigate(Config.CHATGPT_URL)
+            target_url = Config.provider_url()
+            provider_name = "Claude" if Config.PROVIDER == "claude" else "ChatGPT"
+            await browser.navigate(target_url)
             # Apply stealth AFTER navigation (avoids DNS failure in Docker)
             await browser.apply_stealth_patches()
             await asyncio.sleep(3)
@@ -314,9 +317,12 @@ class ChatScreen(Screen):
                 logged_in = await ensure_logged_in(browser)
                 if not logged_in:
                     raise RuntimeError(
-                        "Could not log in to ChatGPT"
+                        f"Could not log in to {provider_name}"
                     )
-            client = ChatGPTClient(page)
+            if Config.PROVIDER == "claude":
+                client = ClaudeClient(page)
+            else:
+                client = ChatGPTClient(page)
             tid = client._extract_thread_id()
             return browser, client, tid
 

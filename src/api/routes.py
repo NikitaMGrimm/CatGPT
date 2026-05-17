@@ -25,6 +25,7 @@ from src.api.schemas import (
 )
 from src.browser.manager import BrowserManager
 from src.chatgpt.client import ChatGPTClient
+from src.claude.client import ClaudeClient
 from src.log import setup_logging
 
 log = setup_logging("api_routes")
@@ -35,12 +36,12 @@ router = APIRouter()
 _lock = asyncio.Lock()
 
 # Global reference — set by the server on startup
-_client: ChatGPTClient | None = None
+_client: ChatGPTClient | ClaudeClient | None = None
 _browser: BrowserManager | None = None
 
 
-def set_client(client: ChatGPTClient, browser: BrowserManager) -> None:
-    """Called by server.py to inject the ChatGPT client instance."""
+def set_client(client: ChatGPTClient | ClaudeClient, browser: BrowserManager) -> None:
+    """Called by server.py to inject the client instance."""
     global _client, _browser
     _client = client
     _browser = browser
@@ -48,7 +49,7 @@ def set_client(client: ChatGPTClient, browser: BrowserManager) -> None:
 
 def _get_client():
     if _client is None:
-        raise HTTPException(status_code=503, detail="ChatGPT client not initialized")
+        raise HTTPException(status_code=503, detail="Client not initialized")
     return _client
 
 
