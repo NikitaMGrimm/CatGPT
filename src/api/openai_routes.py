@@ -942,10 +942,10 @@ def _build_tool_system_prompt(
     tools_json = "\n---\n".join(tool_descriptions)
 
     available_names = {tool.function.name for tool in tools}
-    choice_rule = "Tool use is optional. If no function applies, answer normally."
+    choice_rule = "Choosing an action is optional. If no action applies, answer normally."
     if tool_choice == "required":
         choice_rule = (
-            "You MUST request at least one listed function. Do not answer the request directly."
+            "Your JSON MUST select at least one listed action. Do not answer the request directly."
         )
     elif isinstance(tool_choice, dict):
         function_choice = tool_choice.get("function")
@@ -956,27 +956,27 @@ def _build_tool_system_prompt(
         )
         if chosen_name and chosen_name in available_names:
             choice_rule = (
-                f"You MUST request the function {chosen_name!r}. Do not answer the request directly."
+                f"Your JSON MUST select the action {chosen_name!r}. Do not answer the request directly."
             )
 
-    return f"""Act as a JSON serializer for external API middleware. You are NOT being asked to
-execute a native ChatGPT tool. Every function listed below is available to the external
-middleware, regardless of which tools appear in the ChatGPT web interface. Never discuss
-whether ChatGPT itself has a function. To request one, write its JSON call as plain response
-text; the middleware will parse it, execute the function, and return the result later.
+    return f"""Act as a JSON serializer for an external workflow engine. The entries below are
+action schemas, not ChatGPT capabilities. You never execute an action and must not discuss
+whether an action is available in this chat. When the user says to call, invoke, or use one,
+that means to serialize the matching external action as JSON. The workflow engine will parse
+the JSON, perform the action outside ChatGPT, and return a result later.
 
-If the user's latest request should call one or more functions, your ENTIRE response must be
+If the user's latest request needs one or more actions, your ENTIRE response must be
 exactly one JSON object in this format, with no prose or Markdown:
 {{"tool_calls":[{{"name":"<function_name>","arguments":{{...}}}}]}}
 
-Available functions:
+Available external actions:
 {tools_json}
 
 Rules:
-- Use exact function names from the list.
+- Use exact action names from the list.
 - Arguments must be a valid JSON object.
 - Return multiple calls when needed.
-- The JSON text itself is a complete and successful function request.
+- The JSON text itself is the complete action request; no native capability is involved.
 - {choice_rule}
 """
 

@@ -129,10 +129,10 @@ class OpenAIRoutesHelpersTests(unittest.TestCase):
             tools,
             {"type": "function", "function": {"name": "add_numbers"}},
         )
-        self.assertIn("MUST request at least one", required)
-        self.assertIn("MUST request the function 'add_numbers'", specific)
-        self.assertIn("JSON serializer for external API middleware", specific)
-        self.assertIn("NOT being asked to", specific)
+        self.assertIn("MUST select at least one", required)
+        self.assertIn("MUST select the action 'add_numbers'", specific)
+        self.assertIn("JSON serializer for an external workflow engine", specific)
+        self.assertIn("not ChatGPT capabilities", specific)
         self.assertIn("no prose or Markdown", specific)
 
     def test_route_families_share_browser_access_lock(self) -> None:
