@@ -12,12 +12,12 @@ Tests:
   4. Use the OpenAI SDK client.images.generate()
 
 Prerequisites:
-  - CatGPT API server running: python -m src.api.server
+  - CatGPT API server running: uv run python -m src.api.server
   - OR Docker: docker compose up --build -d catgpt
-  - pip install openai requests
+  - Development dependencies installed: uv sync --group dev
 
 Usage:
-  python scripts/test_image_generation.py
+  uv run python scripts/test_image_generation.py
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from pathlib import Path
 try:
     import requests
 except ImportError:
-    print("ERROR: pip install requests")
+    print("ERROR: run 'uv sync --group dev'")
     sys.exit(1)
 
 try:
@@ -293,7 +293,7 @@ def main():
         print("\n  Health check: OK")
     except requests.ConnectionError:
         print(f"\n  ERROR: Cannot connect to {BASE_URL}")
-        print("  Start the server: python -m src.api.server")
+        print("  Start the server: uv run python -m src.api.server")
         print("  Or Docker: docker compose up --build -d catgpt")
         sys.exit(1)
 

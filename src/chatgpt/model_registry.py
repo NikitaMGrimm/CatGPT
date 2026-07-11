@@ -13,7 +13,7 @@ _DYNAMIC_MODEL_ID = re.compile(r"^(?:gpt-[a-z0-9][a-z0-9._-]*|o\d[a-z0-9._-]*)$"
 _DISCOVERED_MODEL_ID = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 
 # OpenAI's public reasoning-effort order. A model may expose only a subset.
-REASONING_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+REASONING_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 _REASONING_ALIASES: dict[str, tuple[str, ...]] = {
     "none": ("none", "off", "disabled", "no reasoning"),
     "minimal": ("minimal", "minimum", "min", "lowest"),
@@ -22,6 +22,9 @@ _REASONING_ALIASES: dict[str, tuple[str, ...]] = {
     "high": ("high", "deep", "extended", "thinking", "strong"),
     "xhigh": ("xhigh", "x-high", "extra high", "very high", "extreme"),
     "max": ("max", "maximum", "highest"),
+    # ChatGPT UI extension. This is not currently an official OpenAI API
+    # reasoning_effort, but preserving it keeps future picker rows usable.
+    "ultra": ("ultra", "ultra high", "ultrahigh"),
 }
 
 
@@ -74,20 +77,26 @@ def is_dynamic_model_id(model: str) -> bool:
     return bool(_DYNAMIC_MODEL_ID.fullmatch((model or "").strip().lower()))
 
 
-def canonical_reasoning_effort(value: str | None) -> str | None:
-    """Map official values, UI labels, and common aliases to one effort name."""
+def canonical_reasoning_effort(value: str | None, *, substring: bool = False) -> str | None:
+    """Map official values and aliases to one effort name.
+
+    API values use exact normalized matching. Picker labels may opt into
+    controlled substring matching for labels such as ``Instant 5.5``.
+    """
     raw = re.sub(r"[_:.\-]+", " ", (value or "").strip().lower())
     raw = re.sub(r"\s+", " ", raw).strip()
     if not raw:
         return None
 
     # Match the most specific aliases first (for example xhigh before high).
-    priority = ("xhigh", "max", "none", "minimal", "medium", "high", "low")
+    priority = ("ultra", "xhigh", "max", "none", "minimal", "medium", "high", "low")
     compact = normalize_model_token(raw)
     for effort in priority:
         for alias in _REASONING_ALIASES[effort]:
             alias_compact = normalize_model_token(alias)
-            if alias in raw or (alias_compact and alias_compact in compact):
+            if compact == alias_compact:
+                return effort
+            if substring and (alias in raw or (alias_compact and alias_compact in compact)):
                 return effort
     return None
 
@@ -114,14 +123,14 @@ def choose_reasoning_label(requested: str, available_labels: list[str] | tuple[s
     for label in labels:
         label_token = normalize_model_token(label)
         if requested_token and (requested_token in label_token or label_token in requested_token):
-            effort = canonical_reasoning_effort(label) or canonical_reasoning_effort(requested) or "medium"
+            effort = canonical_reasoning_effort(label, substring=True) or canonical_reasoning_effort(requested) or model_label_to_public_id(label)
             return label, effort
 
     requested_effort = canonical_reasoning_effort(requested) or "medium"
     requested_rank = REASONING_EFFORT_ORDER.index(requested_effort)
     candidates: list[tuple[int, bool, int, str, str]] = []
     for position, label in enumerate(labels):
-        effort = canonical_reasoning_effort(label)
+        effort = canonical_reasoning_effort(label, substring=True)
         if not effort:
             continue
         rank = REASONING_EFFORT_ORDER.index(effort)
@@ -161,6 +170,28 @@ def list_reasoning_labels(model: str) -> tuple[str, ...]:
     option = _resolve_base_model(model)
     key = normalize_model_token(option.public_id if option else model)
     return _discovered_reasoning.get(key, ())
+
+
+def get_discovered_catalog() -> tuple[list[str], dict[str, tuple[str, ...]]]:
+    """Return a copy of the process-local live catalog."""
+    labels = [option.ui_label for option in _discovered_models.values()]
+    reasoning = {
+        option.public_id: tuple(_discovered_reasoning.get(key, ()))
+        for key, option in _discovered_models.items()
+    }
+    return labels, reasoning
+
+
+def replace_discovered_catalog(
+    labels: list[str] | tuple[str, ...],
+    reasoning_by_model: dict[str, list[str] | tuple[str, ...]],
+) -> None:
+    """Atomically replace live discovery, removing stale models and levels."""
+    clear_discovered_models()
+    options = register_discovered_models(labels)
+    for option in options:
+        rows = reasoning_by_model.get(option.ui_label) or reasoning_by_model.get(option.public_id) or ()
+        register_discovered_reasoning(option.public_id, rows)
 
 
 def clear_discovered_models() -> None:
@@ -211,7 +242,8 @@ def list_public_chat_models() -> list[str]:
         model_ids.extend(
             f"{option.public_id}-{effort}"
             for effort in dict.fromkeys(
-                canonical_reasoning_effort(label) for label in list_reasoning_labels(option.public_id)
+                canonical_reasoning_effort(label, substring=True) or model_label_to_public_id(label)
+                for label in list_reasoning_labels(option.public_id)
             )
             if effort
         )
@@ -220,7 +252,8 @@ def list_public_chat_models() -> list[str]:
         model_ids.extend(
             f"{alias}-{effort}"
             for effort in dict.fromkeys(
-                canonical_reasoning_effort(label) for label in list_reasoning_labels(option.public_id)
+                canonical_reasoning_effort(label, substring=True) or model_label_to_public_id(label)
+                for label in list_reasoning_labels(option.public_id)
             )
             if effort
         )

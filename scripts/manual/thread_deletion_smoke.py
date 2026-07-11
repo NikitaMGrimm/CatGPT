@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
-import os
 import sys
 import time
 from pathlib import Path
 from uuid import uuid4
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from src.browser.manager import BrowserManager
@@ -17,7 +17,7 @@ from src.config import Config
 
 MANUAL_STEPS = """Manual thread create/delete verification:
 1. Stop any running CatGPT container or local API that is using the same browser profile.
-2. From the repo root, run: .\\.venv\\Scripts\\python.exe test_scratch\\live_thread_delete_check.py
+2. From the repo root, run: uv run python scripts/manual/thread_deletion_smoke.py --confirm-delete
 3. Wait for the browser to open ChatGPT and confirm login.
 4. The script creates a new chat, sends a unique marker prompt, captures the /c/<thread_id> URL, and invokes ChatGPTClient.delete_thread(thread_id).
 5. If testing manually in noVNC instead, open http://localhost:6080/vnc.html, log in, create a new chat, copy the thread id from the URL, hover the matching sidebar row, open its three-dot menu, click Delete, and confirm.
@@ -26,9 +26,20 @@ MANUAL_STEPS = """Manual thread create/delete verification:
 
 
 async def main() -> int:
-    log_dir = ROOT / "logs"
-    log_dir.mkdir(exist_ok=True)
-    log_path = log_dir / "live_thread_delete_check.log"
+    parser = argparse.ArgumentParser(
+        description="Create and permanently delete one live ChatGPT smoke-test thread."
+    )
+    parser.add_argument(
+        "--confirm-delete",
+        action="store_true",
+        help="Required acknowledgement that the test permanently deletes its new thread.",
+    )
+    args = parser.parse_args()
+    if not args.confirm_delete:
+        parser.error("--confirm-delete is required because this test deletes a live thread")
+    log_dir = ROOT / "logs" / "manual"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "thread_deletion_smoke.log"
 
     marker = f"catgpt-delete-smoke-{uuid4().hex[:10]}"
     browser = BrowserManager()

@@ -6,7 +6,7 @@ then tests different input methods for message 2 to find which one
 causes ChatGPT's backend API call to fire.
 
 Run AFTER the server is started (browser is open and logged in).
-Usage: .venv/bin/python scripts/test_input_methods.py
+Usage: uv run python scripts/test_input_methods.py
 """
 
 import asyncio

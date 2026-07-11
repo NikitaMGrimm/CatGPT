@@ -15,10 +15,12 @@ from patchright.async_api import Page
 
 from src.chatgpt.model_registry import (
     choose_reasoning_label,
+    get_discovered_catalog,
     model_label_to_public_id,
     normalize_model_token,
     register_discovered_models,
     register_discovered_reasoning,
+    replace_discovered_catalog,
     resolve_model_request,
 )
 from src.config import Config
@@ -42,6 +44,10 @@ from src.log import setup_logging
 log = setup_logging("chatgpt_client")
 
 
+class ModelSelectionError(RuntimeError):
+    """Raised when an explicitly requested picker state cannot be confirmed."""
+
+
 class ChatGPTClient:
     """
     High-level client for interacting with the ChatGPT web interface.
@@ -54,9 +60,9 @@ class ChatGPTClient:
         self._last_model_label = ""
         self._last_concrete_model_label = ""
         self._last_reasoning_effort = ""
-        self._unavailable_model_keys: set[str] = set()
         self._discovered_model_labels: list[str] = []
         self._model_capabilities_complete = False
+        self._model_capabilities_checked_at = 0.0
         self._recent_backend_events: list[dict] = []
         self._wire_backend_event_logger()
 
@@ -318,30 +324,19 @@ class ChatGPTClient:
         effort = resolved.reasoning_effort
 
         if target is not None:
-            unavailable_key = normalize_model_token(target.public_id)
-            if unavailable_key in self._unavailable_model_keys:
-                self._handle_model_switch_failure(
-                    f"ChatGPT model option '{target.ui_label}' was previously unavailable "
-                    "in this browser session"
-                )
-                return
-
             await self._dismiss_model_picker()
             if not await self._open_model_picker():
-                self._handle_model_switch_failure(
+                raise ModelSelectionError(
                     f"Could not open ChatGPT model picker for '{target.ui_label}'"
                 )
-                return
 
             selected = await self._select_model_from_nested_picker(target.ui_labels)
             if selected is not True:
-                self._unavailable_model_keys.add(unavailable_key)
                 await self._dismiss_model_picker()
-                self._handle_model_switch_failure(
+                raise ModelSelectionError(
                     f"Could not find ChatGPT model option '{target.ui_label}' "
                     "in the concrete-model submenu"
                 )
-                return
 
             self._last_model_label = self._last_concrete_model_label or target.ui_label
             log.info("Model switched to %s", self._last_model_label)
@@ -349,10 +344,9 @@ class ChatGPTClient:
         if effort:
             selected_effort = await self._select_reasoning_effort(effort)
             if not selected_effort:
-                self._handle_model_switch_failure(
+                raise ModelSelectionError(
                     f"Could not select a reasoning effort for '{requested_model}'"
                 )
-                return
             self._last_reasoning_effort = selected_effort
             if resolved.reasoning_from_model_id and reasoning_effort:
                 log.info(
@@ -361,11 +355,6 @@ class ChatGPTClient:
                     reasoning_effort,
                 )
             log.info("Reasoning effort resolved to %s", selected_effort)
-
-    def _handle_model_switch_failure(self, detail: str) -> None:
-        if Config.CHATGPT_MODEL_SWITCH_STRICT:
-            raise RuntimeError(detail)
-        log.warning("%s; continuing with the current ChatGPT picker state", detail)
 
     # ── Navigation ──────────────────────────────────────────────
 
@@ -387,7 +376,8 @@ class ChatGPTClient:
                         "document.querySelectorAll('[data-testid^=\"conversation-turn-\"]').length"
                     )
                     if turn_count == 0:
-                        await self._wait_for_chat_input()
+                        if not await self._wait_for_chat_input():
+                            raise RuntimeError("Configured ChatGPT project composer is not ready")
                         log.info("Already on a fresh chat in the configured project")
                         return
                 except Exception:
@@ -400,7 +390,8 @@ class ChatGPTClient:
             page_error = await self._detect_page_error()
             if page_error:
                 raise RuntimeError(f"Could not open configured ChatGPT project: {page_error}")
-            await self._wait_for_chat_input()
+            if not await self._wait_for_chat_input():
+                raise RuntimeError("Configured ChatGPT project composer is not ready")
             return
 
         # Already on a fresh chat — nothing to do
@@ -478,7 +469,7 @@ class ChatGPTClient:
             await self._wait_for_chat_input()
             return
 
-    async def _wait_for_chat_input(self) -> None:
+    async def _wait_for_chat_input(self) -> bool:
         """Wait for the chat input to become visible and interactive."""
         for selector in Selectors.CHAT_INPUT:
             try:
@@ -486,16 +477,16 @@ class ChatGPTClient:
                 log.debug(f"Chat input ready: {selector}")
                 # Brief settle for React handlers to attach
                 await asyncio.sleep(0.5)
-                return
+                return True
             except Exception:
                 continue
         log.warning("Chat input not found — page may not be fully ready")
-
-        await random_delay(500, 1000)
-        log.info("New chat started (navigated to home)")
+        return False
 
     async def navigate_to_thread(self, thread_id: str) -> None:
-        """Navigate to an existing conversation thread."""
+        """Navigate to an existing conversation and verify the requested scope."""
+        if not re.fullmatch(r"[A-Za-z0-9-]+", (thread_id or "").strip()):
+            raise RuntimeError(f"Invalid ChatGPT thread id: {thread_id!r}")
         project_url = Config.chatgpt_project_url()
         if project_url:
             project_base = project_url[: -len("/project")]
@@ -503,8 +494,24 @@ class ChatGPTClient:
         else:
             url = f"{Config.CHATGPT_URL.rstrip('/')}/c/{thread_id}"
         log.info(f"Navigating to thread: {thread_id}")
-        await self._page.goto(url, wait_until="domcontentloaded")
-        await random_delay(1500, 3000)
+        await self._page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await random_delay(500, 1000)
+        page_error = await self._detect_page_error()
+        if page_error:
+            raise RuntimeError(f"Could not open ChatGPT thread {thread_id}: {page_error}")
+        current_url = (self._page.url or "").split("?", 1)[0].rstrip("/")
+        if self._extract_thread_id() != thread_id:
+            raise RuntimeError(
+                f"ChatGPT did not load requested thread {thread_id}; current URL is {current_url}"
+            )
+        if project_url:
+            expected_prefix = project_url[: -len("/project")] + "/c/"
+            if not current_url.startswith(expected_prefix):
+                raise RuntimeError(
+                    f"Thread {thread_id} is not available in configured ChatGPT project"
+                )
+        if not await self._wait_for_chat_input():
+            raise RuntimeError(f"ChatGPT composer was not ready in thread {thread_id}")
         log.info(f"Thread {thread_id} loaded")
 
     async def get_current_thread_url(self) -> str:
@@ -943,13 +950,19 @@ class ChatGPTClient:
                     };
                     const rowInfo = (el) => {
                         const rect = el.getBoundingClientRect();
+                        const ariaChecked = el.getAttribute("aria-checked");
+                        const dataState = el.getAttribute("data-state");
+                        const checked = ariaChecked !== null && dataState !== null
+                            ? ariaChecked === "true" && dataState === "checked"
+                            : ariaChecked !== null
+                                ? ariaChecked === "true"
+                                : dataState === "checked";
                         return {
                             label: primaryText(el),
                             text: (el.innerText || el.textContent || "").trim().replace(/\s+/g, " "),
-                            ariaChecked: el.getAttribute("aria-checked"),
-                            state: el.getAttribute("data-state"),
-                            checked: el.getAttribute("aria-checked") === "true"
-                                && el.getAttribute("data-state") === "checked",
+                            ariaChecked,
+                            state: dataState,
+                            checked,
                             x: rect.left + rect.width / 2,
                             y: rect.top + rect.height / 2,
                         };
@@ -1212,8 +1225,22 @@ class ChatGPTClient:
 
     async def discover_available_models(self, force: bool = False) -> list[str]:
         """Discover concrete models and every model-specific reasoning row."""
-        if self._model_capabilities_complete and not force:
+        now = time.time()
+        ttl = max(0, Config.CHATGPT_MODEL_DISCOVERY_TTL_SECONDS)
+        if (
+            self._model_capabilities_complete
+            and not force
+            and now - self._model_capabilities_checked_at < ttl
+        ):
             return list(self._discovered_model_labels)
+
+        previous_labels, previous_reasoning = get_discovered_catalog()
+        labels: list[str] = []
+        reasoning_by_model: dict[str, list[str]] = {}
+        initial_model = ""
+        initial_reasoning = ""
+        discovery_complete = False
+        restoration_complete = True
 
         await self._dismiss_model_picker()
         if not await self._open_model_picker():
@@ -1232,42 +1259,78 @@ class ChatGPTClient:
             (row.get("label", "") for row in initial.get("reasoning", []) if row.get("checked")),
             "",
         )
-        register_discovered_models(labels)
-        await self._dismiss_model_picker()
+        self._last_concrete_model_label = initial_model or self._last_concrete_model_label
 
-        for label in labels:
-            if normalize_model_token(label) != normalize_model_token(self._last_concrete_model_label):
+        try:
+            if not labels or not initial_model:
+                log.warning("Capability discovery found no authoritative checked model")
+                return list(previous_labels)
+
+            await self._dismiss_model_picker()
+            discovery_complete = True
+            for label in labels:
+                if normalize_model_token(label) != normalize_model_token(self._last_concrete_model_label):
+                    if not await self._open_model_picker():
+                        log.warning("Capability discovery could not open picker for %s", label)
+                        discovery_complete = False
+                        break
+                    selection = await self._select_model_from_nested_picker((label,))
+                    if selection is not True:
+                        log.warning(
+                            "Capability discovery could not confirm model %s (result=%r)",
+                            label,
+                            selection,
+                        )
+                        discovery_complete = False
+                        break
+
                 if not await self._open_model_picker():
-                    log.warning("Capability discovery could not open picker for %s", label)
-                    continue
-                selection = await self._select_model_from_nested_picker((label,))
-                if selection is not True:
+                    log.warning("Capability discovery could not inspect reasoning rows for %s", label)
+                    discovery_complete = False
+                    break
+                state = await self._nested_model_picker_state()
+                visible_model = (state.get("opener") or {}).get("label", "")
+                if normalize_model_token(visible_model) != normalize_model_token(label):
                     log.warning(
-                        "Capability discovery could not confirm model %s (result=%r)",
+                        "Capability discovery expected %s but picker reported %s",
                         label,
-                        selection,
+                        visible_model or "<unknown>",
                     )
-                    await self._dismiss_model_picker()
-                    continue
-            if not await self._open_model_picker():
-                log.warning("Capability discovery could not inspect reasoning rows for %s", label)
-                continue
-            state = await self._nested_model_picker_state()
-            register_discovered_reasoning(
-                label,
-                [row.get("label", "") for row in state.get("reasoning", []) if row.get("label")],
-            )
-            self._last_concrete_model_label = label
+                    discovery_complete = False
+                    break
+                reasoning_by_model[label] = [
+                    row.get("label", "")
+                    for row in state.get("reasoning", [])
+                    if row.get("label")
+                ]
+                self._last_concrete_model_label = label
+                await self._dismiss_model_picker()
+        finally:
+            await self._dismiss_model_picker()
+            if initial_model:
+                if not await self._open_model_picker():
+                    restoration_complete = False
+                else:
+                    restoration_complete = (
+                        await self._select_model_from_nested_picker((initial_model,)) is True
+                    )
+                if restoration_complete and initial_reasoning:
+                    restoration_complete = bool(
+                        await self._select_reasoning_effort(initial_reasoning)
+                    )
             await self._dismiss_model_picker()
 
-        if initial_model:
-            if await self._open_model_picker():
-                await self._select_model_from_nested_picker((initial_model,))
-            if initial_reasoning:
-                await self._select_reasoning_effort(initial_reasoning)
+            if discovery_complete and restoration_complete and len(reasoning_by_model) == len(labels):
+                replace_discovered_catalog(labels, reasoning_by_model)
+                self._discovered_model_labels = list(dict.fromkeys(labels))
+                self._model_capabilities_complete = True
+                self._model_capabilities_checked_at = time.time()
+            else:
+                replace_discovered_catalog(previous_labels, previous_reasoning)
+                self._discovered_model_labels = list(previous_labels)
+                self._model_capabilities_complete = False
+                log.warning("Model capability discovery was incomplete and will be retried")
 
-        self._discovered_model_labels = list(dict.fromkeys(labels))
-        self._model_capabilities_complete = bool(labels)
         return list(self._discovered_model_labels)
 
     async def _upload_files(self, file_paths: list[str]) -> None:

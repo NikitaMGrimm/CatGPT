@@ -21,7 +21,7 @@ This guide covers every way to run CatGPT Gateway: Docker, local development, an
 
 ## Prerequisites
 
-- **Python 3.9+** (local setup only)
+- **Python 3.11 through 3.14 and uv** (local setup only)
 - **Docker + Docker Compose** (Docker setup only)
 - A **ChatGPT** or **Claude** account (free or paid)
 
@@ -33,33 +33,37 @@ Docker runs the entire stack in one container: virtual display, VNC, browser, an
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/GautamVhavle/CatGPT-Gateway.git
-cd CatGPT-Gateway
+git clone <your-fork-url> CatGPT
+cd CatGPT
 
-# 2. Copy the environment template
-cp .env.example .env
+# 2. Configure the values consumed by docker-compose.yml
+cat > .env <<'EOF'
+DOCKERDIR=/path/to/persistent/storage
+CATGPT_API_KEY=change-this-api-token
+CATGPT_VNC_PASSWORD=change-this-vnc-password
+CHATGPT_PROJECT_URL=
+# Optional: image published by your fork
+# CATGPT_IMAGE=ghcr.io/your-user/catgpt:latest
+EOF
 
-# 3. Edit .env to pick your provider
-#    Set PROVIDER=claude or PROVIDER=chatgpt
-
-# 4. Build and start
+# 3. Build and start
 docker compose up --build -d
 
-# 5. First login (one-time) - open the browser UI
+# 4. First login (one-time) - open the browser UI
 open http://localhost:6080
-# Sign into Claude or ChatGPT in the browser window you see
+# Sign into ChatGPT in the browser window you see
 # Close the noVNC tab when done - session is saved automatically
 
-# 6. Verify it works
-curl -H "Authorization: Bearer dummy123" http://localhost:8000/v1/models
-# {"object":"list","data":[{"id":"claude-browser",...}]}
+# 5. Verify it works (Docker publishes the API on host port 8650)
+curl -H "Authorization: Bearer change-this-api-token" http://localhost:8650/v1/models
+# {"object":"list","data":[{"id":"catgpt-browser",...}]}
 
-# 7. Send your first message
-curl -X POST http://localhost:8000/v1/chat/completions \
+# 6. Send your first message
+curl -X POST http://localhost:8650/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer dummy123" \
+  -H "Authorization: Bearer change-this-api-token" \
   -d '{
-    "model": "claude-browser",
+    "model": "catgpt-browser",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 ```
@@ -72,9 +76,9 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   ```
   `docker restart catgpt` does NOT pick up code changes.
 
-- **Browser session persists** via the `catgpt_browser_data` Docker volume. You only need to log in once.
+- **Browser session persists** in `${DOCKERDIR}/appdata/catgpt/browser`. You only need to log in once.
 
-- **Logs** are bind-mounted to `./docker-logs/` on the host.
+- **Logs and conversation state** are stored below `${DOCKERDIR}/appdata/catgpt/`.
 
 - **noVNC** at `http://localhost:6080` lets you see and interact with the browser (useful for debugging, CAPTCHAs, or re-login). Default VNC password: `catgpt`.
 
@@ -84,33 +88,29 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 ```bash
 # 1. Clone and enter the repo
-git clone https://github.com/GautamVhavle/CatGPT-Gateway.git
-cd CatGPT-Gateway
+git clone <your-fork-url> CatGPT
+cd CatGPT
 
-# 2. Create a virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
+# 2. Create the locked development environment
+uv sync --group dev
 
-# 3. Install dependencies
-pip install -r requirements.txt
+# 3. Install Chromium for Patchright
+uv run patchright install chromium
 
-# 4. Install Chromium for Patchright
-patchright install chromium
-
-# 5. Copy and configure environment
+# 4. Copy and configure environment
 cp .env.example .env
 # Edit .env -> set PROVIDER=claude or PROVIDER=chatgpt
 
-# 6. First login (one-time)
-python scripts/first_login.py
+# 5. First login (one-time)
+uv run python scripts/first_login.py
 # A browser window opens. Sign into your provider. Press Enter when done.
 
-# 7. Start the API server
-python -m src.api.server
+# 6. Start the API server
+uv run python -m src.api.server
 # API is live at http://localhost:8000
 
-# 8. (Optional) Start the terminal chat UI
-python -m src.cli.app
+# 7. (Optional) Start the terminal chat UI
+uv run python -m src.cli.app
 ```
 
 ---
@@ -143,9 +143,8 @@ Notes:
 
 CatGPT Gateway uses your existing browser session. You sign in **once** and the browser profile is persisted.
 
-> **⚠ Google login will not work.**
-> Patchright/Chromium runs in a controlled automation context. Google's OAuth detects this and blocks the sign-in.
-> **Use email + password, Microsoft, Apple, or magic link / OTP instead.**
+> Google OAuth commonly rejects automated Chromium sessions. If it does, use
+> email and password, Microsoft, Apple, or a magic link / OTP instead.
 
 ### Docker
 
@@ -162,11 +161,11 @@ CatGPT Gateway uses your existing browser session. You sign in **once** and the 
    | Magic link / OTP email | ✅ Works |
    | **Google / "Continue with Google"** | ❌ Blocked by Google |
 6. Verify you see the chat interface
-7. Close the noVNC tab — your session is saved in the `catgpt_browser_data` Docker volume and survives container restarts.
+7. Close the noVNC tab. The bind-mounted browser profile survives container restarts.
 
 ### Local
 
-1. Run `python scripts/first_login.py`
+1. Run `uv run python scripts/first_login.py`
 2. A Chromium window opens and navigates to your provider
 3. Sign in using **email + password** or a non-Google method (see table above)
 4. Press Enter in the terminal when you see the chat page
@@ -250,9 +249,9 @@ Default: `catgpt`. Change it via `VNC_PASSWORD` in `.env` or `docker-compose.yml
 
 | Volume | Purpose |
 |---|---|
-| `catgpt_browser_data:/app/browser_data` | Persistent browser session (cookies, login) |
-| `./docker-logs:/app/logs` | Logs accessible from host |
-| `./downloads:/app/downloads` | Generated images and read-aloud audio accessible from host |
+| `${DOCKERDIR}/appdata/catgpt/browser:/app/browser_data` | Persistent browser session (cookies, login) |
+| `${DOCKERDIR}/appdata/catgpt/logs:/app/logs` | Logs accessible from host |
+| `${DOCKERDIR}/appdata/catgpt/state:/app/state` | Durable conversation and Responses routing ledger |
 
 ### Health Check
 
@@ -277,7 +276,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/Projects/CatGPT-Gateway
+WorkingDirectory=%h/Projects/CatGPT
 ExecStart=/usr/bin/env nix run .#proxy
 Restart=on-failure
 RestartSec=5
@@ -314,7 +313,7 @@ cat logs/api_server.log            # Local
 
 Re-login:
 - Docker: Open http://localhost:6080 and sign in
-- Local: Run `python scripts/first_login.py`
+- Local: Run `uv run python scripts/first_login.py`
 
 ### Stale browser lock files
 

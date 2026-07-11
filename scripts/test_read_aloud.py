@@ -7,15 +7,15 @@ Tests:
   2. POST /v1/chat/completions with read_aloud=true
 
 Prerequisites:
-  - CatGPT API server running: python -m src.api.server
+  - CatGPT API server running: uv run python -m src.api.server
   - OR Docker: docker compose up --build -d catgpt
   - Logged in to ChatGPT in the browser session
-  - pip install requests
+  - uv sync --group dev
 
 Usage:
-  python scripts/test_read_aloud.py
-  python scripts/test_read_aloud.py --message "Lee esta frase en voz alta."
-  python scripts/test_read_aloud.py --skip-openai
+  uv run python scripts/test_read_aloud.py
+  uv run python scripts/test_read_aloud.py --message "Lee esta frase en voz alta."
+  uv run python scripts/test_read_aloud.py --skip-openai
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from pathlib import Path
 try:
     import requests
 except ImportError:
-    print("ERROR: pip install requests")
+    print("ERROR: run 'uv sync --group dev'")
     sys.exit(1)
 
 

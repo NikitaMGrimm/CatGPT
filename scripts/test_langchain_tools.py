@@ -10,11 +10,11 @@ Tests:
   5. Image input (single image + text, multiple images)
 
 Prerequisites:
-  - CatGPT API server running: python -m src.api.server
-  - pip install langchain langchain-openai openai
+  - CatGPT API server running: uv run python -m src.api.server
+  - Development dependencies installed: uv sync --group dev
 
 Usage:
-  python scripts/test_langchain_tools.py
+  uv run python scripts/test_langchain_tools.py
 """
 
 from __future__ import annotations

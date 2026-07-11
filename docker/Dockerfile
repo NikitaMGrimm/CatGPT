@@ -1,3 +1,5 @@
+FROM ghcr.io/astral-sh/uv:0.11.28 AS uv
+
 # ── Stage 1: Build ──────────────────────────────────────────────
 FROM python:3.14-slim AS base
 
@@ -51,12 +53,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ── Application setup ───────────────────────────────────────────
 WORKDIR /app
 
-# Install Python dependencies first (layer caching)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install the locked production environment first for Docker layer caching.
+COPY --from=uv /uv /uvx /bin/
+ENV UV_COMPILE_BYTECODE=1
+ENV UV_LINK_MODE=copy
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
+ENV PATH="/app/.venv/bin:$PATH"
 
 # Install patchright's Chromium browser
-RUN patchright install chromium && patchright install-deps chromium
+RUN uv run --frozen --no-dev patchright install chromium \
+    && uv run --frozen --no-dev patchright install-deps chromium
 
 # Copy application code
 COPY src/ src/
@@ -64,7 +71,7 @@ COPY scripts/ scripts/
 
 # ── Directory setup ─────────────────────────────────────────────
 # These will be overridden by volume mounts in docker-compose
-RUN mkdir -p /app/browser_data /app/logs /app/downloads/images /app/downloads/audio
+RUN mkdir -p /app/browser_data /app/logs /app/state /app/downloads/images /app/downloads/audio
 
 # ── Supervisor & entrypoint ─────────────────────────────────────
 COPY docker/supervisord.conf /etc/supervisor/conf.d/catgpt.conf

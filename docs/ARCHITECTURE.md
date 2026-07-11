@@ -10,6 +10,7 @@ A deep dive into how CatGPT Gateway works under the hood.
 - [Browser Lifecycle](#browser-lifecycle)
 - [Stealth and Anti-Detection](#stealth-and-anti-detection)
 - [Message Flow](#message-flow)
+- [Durable Conversation Routing](#durable-conversation-routing)
 - [Response Detection](#response-detection)
 - [Tool Calling](#tool-calling)
 - [File and Image Upload](#file-and-image-upload)
@@ -111,6 +112,30 @@ send_message(text, image_paths, file_paths, read_aloud)
 |       +-- Capture the browser audio response and save to downloads/audio
 +-- 13. Return ChatResponse(message, thread_id, elapsed_ms, images, audio)
 ```
+
+---
+
+## Durable Conversation Routing
+
+OpenAI-compatible state is recorded in a small SQLite ledger. A logical route
+maps `(ChatGPT project, app namespace, conversation id)` to a browser thread,
+the canonical transcript hashes, and the request contract.
+
+- Chat Completions uses the CatGPT `conversation_id` field or
+  `X-CatGPT-Conversation-ID` header. An exact stored-history prefix causes only
+  the new suffix to be sent; a single new user/tool turn is accepted as a
+  delta. Rewound, edited, or unrelated history creates a fresh thread.
+- Responses uses either `conversation` or `previous_response_id`. Each stored
+  response id points to a route revision and transcript snapshot. Continuing a
+  current revision reuses its thread; continuing an older revision branches
+  from that snapshot into a new thread.
+- `CHATGPT_PROJECT_URL` partitions the ledger and forces new/opened ChatGPT
+  threads through that project. App-scoped API paths provide another namespace.
+- The local semantic response cache is bypassed for stateful routes so a cache
+  hit cannot skip required browser-thread state changes.
+
+This keeps browser history compact while preventing independent client chats
+from being merged merely because they came from the same application.
 
 ---
 

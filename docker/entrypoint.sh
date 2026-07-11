@@ -10,7 +10,7 @@ echo "============================================================"
 echo ""
 
 # ── 1. Ensure directories exist ────────────────────────────────
-mkdir -p /app/browser_data /app/logs /app/downloads/images
+mkdir -p /app/browser_data /app/logs /app/state /app/downloads/images
 echo "[entrypoint] Directories ready"
 echo "  Browser data: /app/browser_data"
 echo "  Logs:         /app/logs"
@@ -134,5 +134,3 @@ echo ""
 # ── 8. Start supervisor (manages all processes) ────────────────
 echo "[entrypoint] Starting supervisor..."
 exec /usr/bin/supervisord -c /etc/supervisor/conf.d/catgpt.conf
-
-# tested by Gautam and Harry on 18th February uWu 
