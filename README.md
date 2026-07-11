@@ -43,16 +43,18 @@ specific ChatGPT picker models returned by `GET /v1/models`.
 
 ## How to Setup on Docker
 
-The repository includes a production-style `docker-compose.yml` using the
-published image:
+The repository includes a production-style `docker-compose.yml`. By default it
+builds the checked-out source and tags it with this fork's image name:
 
 ```yaml
-image: ghcr.io/thebadfella/catgpt:latest
+image: ghcr.io/nikitamgrimm/catgpt:latest
+pull_policy: build
 ```
 
-Set `CATGPT_IMAGE` to use an image published by your own fork. The Compose file
-also includes a local build definition, so `docker compose up --build -d`
-builds the checked-out source instead of merely restarting the published image.
+This means plain `docker compose up -d` uses the fork's code instead of pulling
+the upstream image. To deploy a published image, set `CATGPT_IMAGE` and
+`CATGPT_PULL_POLICY=always`. Use `docker compose up --build -d` whenever you
+want to force an immediate local rebuild.
 
 1. Clone the repo.
 

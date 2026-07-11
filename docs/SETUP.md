@@ -42,12 +42,14 @@ DOCKERDIR=/path/to/persistent/storage
 CATGPT_API_KEY=change-this-api-token
 CATGPT_VNC_PASSWORD=change-this-vnc-password
 CHATGPT_PROJECT_URL=
-# Optional: image published by your fork
-# CATGPT_IMAGE=ghcr.io/your-user/catgpt:latest
+# Defaults build the checked-out fork as ghcr.io/nikitamgrimm/catgpt:latest.
+# To pull a published image instead:
+# CATGPT_IMAGE=ghcr.io/nikitamgrimm/catgpt:latest
+# CATGPT_PULL_POLICY=always
 EOF
 
-# 3. Build and start
-docker compose up --build -d
+# 3. Build and start (plain `up` builds the checked-out fork by default)
+docker compose up -d
 
 # 4. First login (one-time) - open the browser UI
 open http://localhost:6080
@@ -75,6 +77,10 @@ curl -X POST http://localhost:8650/v1/chat/completions \
   docker compose up --build -d   # rebuilds and restarts
   ```
   `docker restart catgpt` does NOT pick up code changes.
+
+- **Published-image deployments** can set `CATGPT_PULL_POLICY=always` and
+  `CATGPT_IMAGE=ghcr.io/nikitamgrimm/catgpt:latest`. The default `build` policy
+  deliberately prioritizes checked-out fork code.
 
 - **Browser session persists** in `${DOCKERDIR}/appdata/catgpt/browser`. You only need to log in once.
 
