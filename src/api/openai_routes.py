@@ -2489,8 +2489,11 @@ async def _execute_chat_completion(
                 and routing_action in {"verified-prefix-delta", "single-turn-delta"}
             )
 
-            # If tools are provided, inject tool definitions as a system prompt
-            if request.tools and request.tool_choice != "none" and not continuing_conversation:
+            # Tool definitions are request-scoped and may be introduced or
+            # changed after a sticky conversation starts. Always send them for
+            # a tool-enabled turn; otherwise a delta turn can make ChatGPT
+            # believe the client-side function is unavailable.
+            if request.tools and request.tool_choice != "none":
                 tool_system = _build_tool_system_prompt(request.tools, request.tool_choice)
                 if tool_system:
                     # Prepend as the first system message
