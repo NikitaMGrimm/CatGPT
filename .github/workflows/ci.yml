@@ -35,6 +35,7 @@ jobs:
           version: "0.11.28"
           enable-cache: true
           cache-dependency-glob: uv.lock
+          cache-suffix: py${{ matrix.python-version }}
 
       - name: Install Python
         run: uv python install ${{ matrix.python-version }}
