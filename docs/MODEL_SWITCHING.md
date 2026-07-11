@@ -1,98 +1,85 @@
 # ChatGPT Model Switching
 
-CatGPT supports browser-backed ChatGPT model switching. When a request includes
-a configured model id, CatGPT opens the ChatGPT model picker, selects the
-matching UI label, waits for confirmation, and then sends the prompt.
+CatGPT discovers concrete models from the logged-in account's live ChatGPT
+picker. It does not ship a fixed model catalog, so Free, Plus, Pro, Business,
+and Enterprise accounts can expose different model ids.
 
 ## Quick Use
 
-OpenAI-compatible request:
+List the models currently visible to the account:
+
+```bash
+curl http://localhost:8000/v1/models \
+  -H "Authorization: Bearer dummy123"
+```
+
+Then pass one of the returned ids:
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer dummy123" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-5.5-thinking",
-    "messages": [{"role": "user", "content": "Say which mode you are using."}]
+    "model": "<id-from-v1-models>",
+    "messages": [{"role": "user", "content": "Reply with one sentence."}]
   }'
 ```
 
-Native request:
+## Discovery and naming
 
-```bash
-curl http://localhost:8000/chat \
-  -H "Authorization: Bearer dummy123" \
-  -H "Content-Type: application/json" \
-  -d '{"model": "gpt-5.5", "message": "Hello from a selected model."}'
-```
+CatGPT opens the composer picker, follows its structural concrete-model submenu,
+and reads its visible `menuitemradio` rows. Labels are converted to lowercase
+API-style slugs: spaces and punctuation become hyphens while dotted versions
+are preserved. A label shaped like `GPT-X.Y Variant` therefore becomes
+`gpt-x.y-variant`.
 
-List configured model ids:
+Selection is confirmed by reopening the concrete submenu and checking that the
+requested row has `aria-checked="true"` or `data-state="checked"`. The visible
+composer pill is used only to find the picker; intelligence labels such as
+`High`, `Medium`, or `Instant` are not treated as proof of the concrete model.
 
-```bash
-curl http://localhost:8000/v1/models -H "Authorization: Bearer dummy123"
-```
+When a base GPT family id has one discovered suffixed variant, CatGPT can match
+that unique variant automatically. If several variants share the same base,
+use the concrete id returned by `/v1/models` or configure an explicit alias.
 
 ## Configuration
 
-`CHATGPT_MODEL_ALIASES` maps public API ids to visible ChatGPT picker labels:
+`catgpt-browser`, `auto`, `default`, and `browser` keep the current selection
+unless `CHATGPT_DEFAULT_MODEL` is set to a model id returned by `/v1/models`.
 
-```env
-CHATGPT_MODEL_ALIASES=gpt-5.5=Instant|Latest 5.5|5.5|GPT-5.5,gpt-5.5-thinking=Thinking,gpt-5.5-pro=Pro,gpt-5.4=5.4,gpt-5.4-thinking=Thinking 5.4,gpt-5.4-pro=Pro 5.4,gpt-5.3=5.3,o3=o3
-```
-
-Format:
+`CHATGPT_MODEL_ALIASES` is an optional override for unusual or legacy layouts:
 
 ```text
 public_id=Primary UI Label|Alternate UI Label|Another Alternate
 ```
 
-`CHATGPT_MODEL_SETTINGS` maps model ids or UI labels to the extra setting shown
-beside configurable picker rows such as `Thinking` and `Pro`:
+It is empty by default. Reasoning/intelligence rows are discovered per model
+from the same nested picker; there is no model-specific settings catalog.
 
-```env
-CHATGPT_MODEL_SETTINGS=gpt-5.5-thinking=Extended,gpt-5.5-pro=Standard,gpt-5.4-thinking=Extended,gpt-5.4-pro=Standard
-```
+Chat Completions accepts the official `reasoning_effort` field. Responses
+accepts `reasoning: {"effort": "..."}`. `/v1/models` also lists generated
+`<base-model>-<effort>` ids for every live-discovered combination. A suffix in
+the model id wins over an explicit field. Aliases such as `instant`, `light`,
+`standard`, `deep`, and `maximum` are normalized, and requests outside a
+model's visible range clamp to its nearest available row.
 
-The default configuration exposes `gpt-5.5`, `gpt-5.5-thinking`,
-`gpt-5.5-pro`, `gpt-5.4`, `gpt-5.4-thinking`, `gpt-5.4-pro`, `gpt-5.3`,
-and `o3`. The configurable Thinking/Pro rows are set to `Standard` by default.
-Use `Standard` or `Extended` exactly as shown in the ChatGPT picker.
-
-If a request uses `catgpt-browser`, CatGPT keeps the current browser-selected
-model unless `CHATGPT_DEFAULT_MODEL` is set:
-
-```env
-CHATGPT_DEFAULT_MODEL=gpt-5.5-thinking
-```
-
-By default, if a configured model is not visible in the account's picker, CatGPT
-logs the visible options and continues with the currently selected browser
-model. To fail the request instead:
+By default, an unavailable requested model logs the visible options and keeps
+the current browser model. To fail the request instead:
 
 ```env
 CHATGPT_MODEL_SWITCH_STRICT=true
 ```
 
-`CHATGPT_MODEL_SWITCH_TIMEOUT` is measured in milliseconds and controls how long
-CatGPT waits for the selected model label to appear after clicking an option.
-For example:
+`CHATGPT_MODEL_SWITCH_TIMEOUT` is measured in milliseconds:
 
 ```env
-CHATGPT_MODEL_SWITCH_TIMEOUT=10000  # 10 seconds
+CHATGPT_MODEL_SWITCH_TIMEOUT=10000
 ```
-
-Do not set `CHATGPT_MODEL_SWITCH_TIMEOUT=1` expecting one second; that is 1 ms.
 
 ## Notes
 
 - Model availability depends on the logged-in ChatGPT account and plan.
-- Versioned GPT labels such as `5.4` may live under the picker option
-  `Configure...` rather than in the first menu. CatGPT opens Configure and
-  selects the requested version from the dialog's Model dropdown when needed.
-- UI labels change over time. Update `CHATGPT_MODEL_ALIASES` when ChatGPT
-  renames picker items.
-- The CLI also supports `/model <name>`, which changes the model id sent to the
-  API for later messages.
-- Issue #8 is implemented by `src/chatgpt/model_registry.py` and
-  `ChatGPTClient.ensure_model()`.
+- `/v1/models` refreshes live discovery before returning cached model ids.
+- Selection depends only on the current nested menu roles, ARIA linkage, and
+  checked radio state; obsolete Configure-layout heuristics are not used.
+- The CLI supports `/model <name>` for ids returned by `/v1/models`.

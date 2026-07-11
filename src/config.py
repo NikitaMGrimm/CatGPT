@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 try:
     from dotenv import load_dotenv
@@ -46,15 +47,12 @@ class Config:
     SLOW_MO: int = int(os.getenv("SLOW_MO", "25"))
     BROWSER_CHANNEL: str = os.getenv("BROWSER_CHANNEL", "chrome").strip().lower()
     CHATGPT_URL: str = os.getenv("CHATGPT_URL", "https://chatgpt.com")
+    CHATGPT_PROJECT_URL: str = os.getenv("CHATGPT_PROJECT_URL", "").strip()
     CLAUDE_URL: str = os.getenv("CLAUDE_URL", "https://claude.ai")
     CHATGPT_DEFAULT_MODEL: str = os.getenv("CHATGPT_DEFAULT_MODEL", "")
     CHATGPT_MODEL_ALIASES: str = os.getenv(
         "CHATGPT_MODEL_ALIASES",
-        "gpt-5.5=Instant|Latest 5.5|5.5|GPT-5.5,gpt-5.5-thinking=Thinking|5.5 Thinking|Thinking 5.5|GPT-5.5 Thinking,gpt-5.5-pro=Pro|5.5 Pro|Pro 5.5|GPT-5.5 Pro,gpt-5.4=5.4|GPT-5.4|Instant 5.4,gpt-5.4-thinking=Thinking 5.4|5.4 Thinking|GPT-5.4 Thinking,gpt-5.4-pro=Pro 5.4|5.4 Pro|GPT-5.4 Pro,gpt-5.3=5.3|GPT-5.3|Instant 5.3,o3=o3",
-    )
-    CHATGPT_MODEL_SETTINGS: str = os.getenv(
-        "CHATGPT_MODEL_SETTINGS",
-        "gpt-5.5-thinking=Standard,gpt-5.5-pro=Standard,gpt-5.4-thinking=Standard,gpt-5.4-pro=Standard",
+        "",
     )
     CHATGPT_MODEL_SWITCH_TIMEOUT: int = int(os.getenv("CHATGPT_MODEL_SWITCH_TIMEOUT", "10000"))
     CHATGPT_MODEL_SWITCH_STRICT: bool = os.getenv("CHATGPT_MODEL_SWITCH_STRICT", "false").lower() == "true"
@@ -74,6 +72,21 @@ class Config:
         if cls.PROVIDER == "claude":
             return cls.CLAUDE_URL
         return cls.CHATGPT_URL
+
+    @classmethod
+    def chatgpt_project_url(cls) -> str:
+        """Return a validated optional ChatGPT project-root URL."""
+        value = (cls.CHATGPT_PROJECT_URL or "").strip().rstrip("/")
+        if not value:
+            return ""
+        parsed = urlparse(value)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path.rstrip("/")
+        if parsed.scheme not in {"http", "https"} or host not in {"chatgpt.com", "www.chatgpt.com"}:
+            raise ValueError("CHATGPT_PROJECT_URL must use https://chatgpt.com")
+        if not path.startswith("/g/g-p-") or not path.endswith("/project"):
+            raise ValueError("CHATGPT_PROJECT_URL must be a ChatGPT project URL ending in /project")
+        return f"https://chatgpt.com{path}"
 
     # Timeouts (ms)
     RESPONSE_TIMEOUT: int = int(os.getenv("RESPONSE_TIMEOUT", "120000"))

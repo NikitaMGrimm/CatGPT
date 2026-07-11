@@ -72,6 +72,7 @@ from src.api.openai_schemas import (
     ChatCompletionRequest,
     ChatMessage,
     ResponsesRequest,
+    ReasoningOptions,
     ResponsesResponse,
     ChatCompletionResponse,
     UsageInfo,
@@ -385,6 +386,24 @@ class ResponsesAPITests(unittest.TestCase):
         self.assertEqual(len(chat_req.tools), 1)
         self.assertEqual(chat_req.tool_choice, "auto")
 
+    def test_responses_reasoning_effort_translates_to_chat_field(self) -> None:
+        req = ResponsesRequest(
+            model="gpt-5.6-sol",
+            input="Hello",
+            reasoning=ReasoningOptions(effort="high"),
+        )
+        chat_req = _responses_request_to_chat_request(req)
+        self.assertEqual(chat_req.reasoning_effort, "high")
+
+    def test_chat_schema_accepts_official_reasoning_effort(self) -> None:
+        req = ChatCompletionRequest(
+            model="gpt-5.6-sol-high",
+            messages=[ChatMessage(role="user", content="Hello")],
+            reasoning_effort="low",
+        )
+        _validate_chat_request(req)
+        self.assertEqual(req.reasoning_effort, "low")
+
     def test_validate_chat_request_accepts_stream(self) -> None:
         """Stream=true is allowed; route handlers emit pseudo-SSE after completion."""
         req = ChatCompletionRequest(
@@ -570,7 +589,7 @@ class ResponsesAPITests(unittest.TestCase):
 
     def test_validate_responses_request_rejects_unsupported_model(self) -> None:
         """Unsupported model raises HTTPException."""
-        req = ResponsesRequest(model="gpt-42", input="Hello")
+        req = ResponsesRequest(model="not-a-model", input="Hello")
         with self.assertRaises(HTTPException) as ctx:
             _validate_responses_request(req)
         self.assertEqual(ctx.exception.status_code, 400)

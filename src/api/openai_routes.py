@@ -156,6 +156,14 @@ def _model_copy_compat(model: Any, **kwargs):
     return cloned
 
 
+def _chat_reasoning_effort(request: ChatCompletionRequest) -> str | None:
+    """Read the official Chat field, with nested reasoning as a convenience."""
+    if request.reasoning_effort:
+        return request.reasoning_effort
+    reasoning = getattr(request, "reasoning", None)
+    return getattr(reasoning, "effort", None) if reasoning else None
+
+
 def _shrink_for_cache(value: Any) -> Any:
     """Reduce large strings to a digest so cache-key generation stays cheap."""
     if isinstance(value, str):
@@ -1594,6 +1602,12 @@ async def _execute_image_generation(
 @openai_router.get("/v1/models", response_model=ModelListResponse)
 async def list_models() -> ModelListResponse:
     """List available browser-backed chat model ids."""
+    if isinstance(_client, ChatGPTClient):
+        try:
+            async with browser_access_lock:
+                await _client.discover_available_models()
+        except Exception as exc:
+            log.warning("Could not refresh models from the live ChatGPT picker: %s", exc)
     return ModelListResponse(
         data=[ModelObject(id=model_id, owned_by="catgpt") for model_id in list_public_chat_models()]
     )
@@ -1762,6 +1776,7 @@ def _responses_request_to_chat_request(resp_req: ResponsesRequest) -> ChatComple
         top_p=resp_req.top_p,
         stream=resp_req.stream if resp_req.stream is not None else False,
         user=resp_req.user,
+        reasoning_effort=(resp_req.reasoning.effort if resp_req.reasoning else None),
         read_aloud=bool(resp_req.read_aloud),
     )
 
@@ -2216,6 +2231,7 @@ async def _execute_chat_completion(
                     image_paths=image_paths or None,
                     file_paths=file_paths or None,
                     model=request.model,
+                    reasoning_effort=_chat_reasoning_effort(request),
                     read_aloud=bool(request.read_aloud),
                 )
             except Exception as e:
@@ -2267,6 +2283,7 @@ async def _execute_chat_completion(
                         image_paths=image_paths or None,
                         file_paths=file_paths or None,
                         model=request.model,
+                        reasoning_effort=_chat_reasoning_effort(request),
                     )
                     response_text = full_retry.message
                     elapsed_ms = int((time.time() - start_time) * 1000)
@@ -2331,6 +2348,7 @@ async def _execute_chat_completion(
                             image_paths=image_paths or None,
                             file_paths=file_paths or None,
                             model=request.model,
+                            reasoning_effort=_chat_reasoning_effort(request),
                         )
                         retry_text = retry_result.message
                         retry_text = _normalize_structured_content(retry_text, effective_response_format)

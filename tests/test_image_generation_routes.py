@@ -53,6 +53,13 @@ except ModuleNotFoundError:
 class _StubImageClient:
     def __init__(self) -> None:
         self.calls: list[dict] = []
+        self._thread_id = ""
+
+    async def new_chat(self) -> None:
+        self._thread_id = "thread-1"
+
+    def _extract_thread_id(self) -> str:
+        return self._thread_id
 
     async def generate_image(
         self,

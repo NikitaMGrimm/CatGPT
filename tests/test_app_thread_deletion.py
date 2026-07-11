@@ -24,7 +24,7 @@ if "patchright" not in sys.modules:
     async_api_mod.Request = object
     async_api_mod.Response = object
 
-    async def _fake_async_playwright():
+    def _fake_async_playwright():
         return None
 
     async_api_mod.async_playwright = _fake_async_playwright

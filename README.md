@@ -123,35 +123,24 @@ docker compose up --build -d
 
 ## Supported Models
 
-CatGPT exposes `catgpt-browser` plus the configured ChatGPT picker models. The
-model switcher is driven by `CHATGPT_MODEL_ALIASES` and
-`CHATGPT_MODEL_SETTINGS`, so you can update labels when ChatGPT changes the UI.
+CatGPT exposes `catgpt-browser` plus the concrete models discovered from the
+logged-in account's live picker. Different Free, Plus, Pro, Business, and
+Enterprise accounts can therefore expose different `/v1/models` results.
 
-| API model id | ChatGPT picker target | Accepted aliases | Standard / Extended setting |
-| --- | --- | --- | --- |
-| `catgpt-browser` | Current browser model, or `CHATGPT_DEFAULT_MODEL` when set | `auto`, `default`, `browser` | No |
-| `gpt-5.5` | Instant / latest 5.5 | `Instant`, `Latest 5.5`, `5.5`, `GPT-5.5` | No |
-| `gpt-5.5-thinking` | Thinking on 5.5 | `Thinking`, `5.5 Thinking`, `Thinking 5.5`, `GPT-5.5 Thinking` | Yes |
-| `gpt-5.5-pro` | Pro on 5.5 | `Pro`, `5.5 Pro`, `Pro 5.5`, `GPT-5.5 Pro` | Yes |
-| `gpt-5.4` | 5.4 / Instant 5.4 | `5.4`, `GPT-5.4`, `Instant 5.4` | No |
-| `gpt-5.4-thinking` | Thinking on 5.4 | `Thinking 5.4`, `5.4 Thinking`, `GPT-5.4 Thinking` | Yes |
-| `gpt-5.4-pro` | Pro on 5.4 | `Pro 5.4`, `5.4 Pro`, `GPT-5.4 Pro` | Yes |
-| `gpt-5.3` | 5.3 / Instant 5.3 | `5.3`, `GPT-5.3`, `Instant 5.3` | No |
-| `o3` | o3 | `o3` | No |
+Picker labels are converted to lowercase API-style slugs: punctuation and
+spaces become hyphens while dotted versions are preserved. For example, a
+label shaped like `GPT-X.Y Variant` becomes `gpt-x.y-variant`. Requests using a
+base GPT family id can match a single discovered variant from that family.
 
-Default configurable settings:
-
-```env
-CHATGPT_MODEL_SETTINGS=gpt-5.5-thinking=Standard,gpt-5.5-pro=Standard,gpt-5.4-thinking=Standard,gpt-5.4-pro=Standard
-```
-
-Example: default all `catgpt-browser` requests to 5.4 Thinking Extended.
-
-```yaml
-environment:
-  CHATGPT_DEFAULT_MODEL: "gpt-5.4-thinking"
-  CHATGPT_MODEL_SETTINGS: "gpt-5.4-thinking=Extended"
-```
+`catgpt-browser`, `auto`, `default`, and `browser` keep the current browser
+model unless `CHATGPT_DEFAULT_MODEL` is set. `CHATGPT_MODEL_ALIASES` remains an
+optional `public-id=Visible Label|Alternate Label` override for unusual or
+legacy picker layouts; it is empty by default. Reasoning rows are discovered
+per model. Use Chat Completions `reasoning_effort`, Responses
+`reasoning: {"effort": "high"}`, or a generated id such as
+`gpt-5.6-sol-high` from `/v1/models`. A model-id suffix takes precedence over
+an explicit reasoning field, and unsupported efforts clamp to the closest
+visible row.
 
 ## Docker Environment Variables
 
@@ -184,8 +173,8 @@ environment:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CHATGPT_DEFAULT_MODEL` | empty | Model to use when a request asks for `catgpt-browser`, `auto`, or `default`. |
-| `CHATGPT_MODEL_ALIASES` | Current 5.5, 5.4, 5.3, and o3 aliases | Comma-separated `model=label|alias` map for ChatGPT UI labels. |
-| `CHATGPT_MODEL_SETTINGS` | Thinking/Pro set to `Standard` | Comma-separated setting map for Thinking/Pro rows. |
+| `CHATGPT_MODEL_ALIASES` | empty | Optional comma-separated `model=label|alias` override map for legacy or unusual picker labels. |
+| `CHATGPT_PROJECT_URL` | empty | Optional ChatGPT project URL. New chats are created only in that project. |
 | `CHATGPT_MODEL_SWITCH_TIMEOUT` | `10000` | Milliseconds to wait for a model label after switching. |
 | `CHATGPT_MODEL_SWITCH_STRICT` | `false` | Return an error when a configured model is not visible instead of continuing. |
 
@@ -252,7 +241,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="gpt-5.4-thinking",
+    model="catgpt-browser",
     messages=[
         {"role": "user", "content": "Summarize why browser-backed APIs are useful."}
     ],
@@ -319,8 +308,9 @@ http://localhost:8650/linkwarden/v1/chat/completions
 http://localhost:8650/immich/v1/chat/completions
 ```
 
-With `API_APP_THREAD_MODE=true`, CatGPT can keep those apps in separate ChatGPT
-threads.
+With `API_APP_THREAD_MODE=true`, CatGPT keeps those apps in separate sticky
+threads. If `CHATGPT_PROJECT_URL` is configured, the new threads are created in
+that project and mapped threads are reopened through project-scoped URLs.
 
 ### Useful things to run through CatGPT
 

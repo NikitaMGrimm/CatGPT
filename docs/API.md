@@ -83,6 +83,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `model` | string | yes | `claude-browser` or `catgpt-browser` |
+| `reasoning_effort` | string | no | Official Chat Completions reasoning effort; CatGPT maps aliases and clamps to the model's visible rows |
 | `messages` | array | yes | Array of message objects |
 | `tools` | array | no | Tool/function definitions |
 | `tool_choice` | string/object | no | `auto`, `none`, `required`, or specific function |
@@ -410,7 +411,9 @@ curl -X POST http://localhost:8000/v1/images/generations \
 
 **`GET /v1/models`**
 
-Returns the available model based on the active provider.
+For ChatGPT, returns `catgpt-browser`, live-discovered concrete model ids, and
+every live-discovered `<model>-<effort>` combination. The catalog is derived
+from the signed-in account rather than a hardcoded plan/model list.
 
 ```bash
 curl http://localhost:8000/v1/models -H "Authorization: Bearer dummy123"
@@ -458,6 +461,7 @@ curl -X POST http://localhost:8000/v1/responses \
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `model` | string | yes | `claude-browser` or `catgpt-browser` |
+| `reasoning` | object | no | Responses-style object such as `{"effort": "high"}` |
 | `input` | string or array | yes | User input as a string or array of input items with `role` and `content` |
 | `instructions` | string | no | System instructions (converted to a system message) |
 | `tools` | array | no | Tool/function definitions (same format as chat completions) |

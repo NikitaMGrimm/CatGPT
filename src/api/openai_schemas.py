@@ -73,6 +73,14 @@ class PageExtractionOptions(BaseModel):
     mode: str = "structured"
 
 
+class ReasoningOptions(BaseModel):
+    """OpenAI Responses reasoning options; only effort maps to the web picker."""
+    effort: Optional[str] = None
+    mode: Optional[str] = None
+    summary: Optional[str] = None
+    context: Optional[str] = None
+
+
 class ChatCompletionRequest(BaseModel):
     """OpenAI-compatible chat completion request body."""
     model: str = "catgpt-browser"
@@ -88,6 +96,10 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     n: Optional[int] = 1
     user: Optional[str] = None
+    # Official Chat Completions field. The nested form is also accepted as a
+    # convenience for clients that share payload builders with Responses.
+    reasoning_effort: Optional[str] = None
+    reasoning: Optional[ReasoningOptions] = None
     # CatGPT extension: explicit thread targeting for app-level isolation.
     thread_id: Optional[str] = None
     response_format: Optional[Any] = None
@@ -228,6 +240,7 @@ class ResponsesRequest(BaseModel):
     stream: Optional[bool] = False
     metadata: Optional[dict[str, Any]] = None
     user: Optional[str] = None
+    reasoning: Optional[ReasoningOptions] = None
     # CatGPT extension
     read_aloud: Optional[bool] = False
 

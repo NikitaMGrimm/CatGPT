@@ -14,9 +14,12 @@ import time
 from patchright.async_api import Page
 
 from src.chatgpt.model_registry import (
-    list_switchable_models,
+    choose_reasoning_label,
+    model_label_to_public_id,
     normalize_model_token,
-    resolve_requested_model,
+    register_discovered_models,
+    register_discovered_reasoning,
+    resolve_model_request,
 )
 from src.config import Config
 from src.selectors import Selectors
@@ -49,9 +52,11 @@ class ChatGPTClient:
     def __init__(self, page: Page) -> None:
         self._page = page
         self._last_model_label = ""
-        self._last_model_version_label = ""
-        self._last_model_setting_by_key: dict[str, str] = {}
+        self._last_concrete_model_label = ""
+        self._last_reasoning_effort = ""
         self._unavailable_model_keys: set[str] = set()
+        self._discovered_model_labels: list[str] = []
+        self._model_capabilities_complete = False
         self._recent_backend_events: list[dict] = []
         self._wire_backend_event_logger()
 
@@ -67,6 +72,7 @@ class ChatGPTClient:
         image_paths: list[str] | None = None,
         file_paths: list[str] | None = None,
         model: str | None = None,
+        reasoning_effort: str | None = None,
         read_aloud: bool = False,
     ) -> ChatResponse:
         """
@@ -108,8 +114,8 @@ class ChatGPTClient:
         log.debug(f"Latest user turn before send: {pre_user_signature}")
 
         # 1. Switch model if requested before interacting with the composer
-        if model:
-            await self.ensure_model(model)
+        if model or reasoning_effort:
+            await self.ensure_model(model or "catgpt-browser", reasoning_effort=reasoning_effort)
 
         # 2. Brief pause (human would take a moment to start typing)
         await random_delay(250, 700)
@@ -301,144 +307,65 @@ class ChatGPTClient:
 
         return await self.send_message("\n\n".join(part for part in prompt_parts if part.strip()))
 
-    async def ensure_model(self, requested_model: str) -> None:
-        """Switch ChatGPT's model picker to the requested model when possible."""
-        target = resolve_requested_model(requested_model)
-        if target is None:
-            log.debug(f"No explicit browser model switch needed for request model={requested_model!r}")
-            return
-        target_version_label = self._model_version_label_for_option(target)
-        target_setting_label = self._model_setting_label_for_option(target)
-        unavailable_keys = {
-            key
-            for key in (
-                normalize_model_token(requested_model),
-                normalize_model_token(target.public_id),
-                *(normalize_model_token(label) for label in target.ui_labels),
-            )
-            if key
-        }
-        if self._unavailable_model_keys.intersection(unavailable_keys):
-            detail = (
-                f"ChatGPT model option '{target.ui_label}' was previously unavailable "
-                "in this browser session"
-            )
-            self._handle_model_switch_failure(detail)
-            return
+    async def ensure_model(
+        self,
+        requested_model: str,
+        reasoning_effort: str | None = None,
+    ) -> None:
+        """Select a concrete model and its closest available reasoning effort."""
+        resolved = resolve_model_request(requested_model, reasoning_effort)
+        target = resolved.model
+        effort = resolved.reasoning_effort
 
-        current_label = await self._detect_current_model_label()
-        if current_label and self._label_matches_model_option(current_label, target):
-            if (
-                not self._model_version_needs_configure(target, target_version_label)
-                and self._model_setting_is_current(target, target_setting_label)
-            ):
-                self._last_model_label = target.ui_label
-                log.debug(f"ChatGPT model already selected: {target.ui_label}")
-                return
-
-        log.info(
-            "Switching ChatGPT model: request=%s target=%s current=%s",
-            requested_model,
-            target.ui_label,
-            current_label or self._last_model_label or "unknown",
-        )
-
-        opened = await self._open_model_picker(target.ui_label, current_label=current_label)
-        if not opened:
-            await self._dismiss_model_picker()
-            self._handle_model_switch_failure(f"Could not open ChatGPT model picker for '{target.ui_label}'")
-            return
-
-        await asyncio.sleep(0.4)
-
-        switched = await self._click_model_option(target.ui_labels)
-        if not switched:
-            more_models_opened = await self._click_menu_text("More models")
-            if more_models_opened:
-                await asyncio.sleep(0.3)
-                switched = await self._click_model_option(target.ui_labels)
-
-        if not switched:
-            configure_opened = await self._click_menu_text("Configure")
-            if configure_opened:
-                await asyncio.sleep(0.5)
-                switched = await self._select_model_from_configure_dialog(
-                    target.ui_labels,
-                    target_version_label=target_version_label,
-                )
-                if switched and target_version_label:
-                    self._last_model_version_label = target_version_label
-
-        if not switched:
-            self._unavailable_model_keys.update(unavailable_keys)
-            visible_options = await self._collect_visible_model_options()
-            detail = f"Could not find ChatGPT model option '{target.ui_label}' in the model picker"
-            if visible_options:
-                detail = f"{detail}; visible options included: {', '.join(visible_options[:12])}"
-            await self._dismiss_model_picker()
-            self._handle_model_switch_failure(detail)
-            return
-
-        if target_version_label and not self._model_version_is_current(target_version_label):
-            version_configured = await self._ensure_configured_model_version(target_version_label)
-            if not version_configured:
-                visible_options = await self._collect_visible_model_options()
-                detail = f"Could not configure ChatGPT model version '{target_version_label}'"
-                if visible_options:
-                    detail = f"{detail}; visible options included: {', '.join(visible_options[:12])}"
-                await self._dismiss_model_picker()
-                self._handle_model_switch_failure(detail)
-                return
-            self._last_model_version_label = target_version_label
-
-        setting_applied = False
-        if target_setting_label and not self._model_setting_is_current(target, target_setting_label):
-            setting_configured = await self._ensure_model_setting(target, target_setting_label)
-            if setting_configured is False:
-                visible_options = await self._collect_visible_model_options()
-                detail = f"Could not configure ChatGPT model setting '{target.ui_label} -> {target_setting_label}'"
-                if visible_options:
-                    detail = f"{detail}; visible options included: {', '.join(visible_options[:12])}"
-                await self._dismiss_model_picker()
-                self._handle_model_switch_failure(detail)
-                return
-            if setting_configured:
-                self._last_model_setting_by_key[self._model_setting_cache_key(target)] = target_setting_label
-                setting_applied = True
-
-        if self._is_configure_only_version_option(target, target_version_label):
-            confirmed = self._model_version_is_current(target_version_label)
-            if not confirmed:
+        if target is not None:
+            unavailable_key = normalize_model_token(target.public_id)
+            if unavailable_key in self._unavailable_model_keys:
                 self._handle_model_switch_failure(
-                    f"Model switch to '{target.ui_label}' could not be confirmed via Configure"
+                    f"ChatGPT model option '{target.ui_label}' was previously unavailable "
+                    "in this browser session"
                 )
                 return
-        else:
-            confirmation_labels = self._model_confirmation_labels(target, target_setting_label)
-            confirmed = await self._wait_for_model_label(confirmation_labels)
-            if not confirmed:
-                current_after = await self._detect_current_model_label()
-                if normalize_model_token(current_after) not in {
-                    normalize_model_token(label) for label in confirmation_labels
-                }:
-                    await self._dismiss_model_picker()
-                    await asyncio.sleep(1.0)
-                    current_after = await self._detect_current_model_label()
-                    if normalize_model_token(current_after) not in {
-                        normalize_model_token(label) for label in confirmation_labels
-                    }:
-                        self._handle_model_switch_failure(
-                            f"Model switch to '{target.ui_label}' could not be confirmed"
-                        )
-                        return
 
-        await self._dismiss_model_picker()
-        self._last_model_label = target.ui_label
-        if target_version_label:
-            self._last_model_version_label = target_version_label
-        if target_setting_label and (setting_applied or self._model_setting_is_current(target, target_setting_label)):
-            self._last_model_setting_by_key[self._model_setting_cache_key(target)] = target_setting_label
-        log.info(f"Model switched to {target.ui_label}")
+            await self._dismiss_model_picker()
+            if not await self._open_model_picker():
+                self._handle_model_switch_failure(
+                    f"Could not open ChatGPT model picker for '{target.ui_label}'"
+                )
+                return
+
+            selected = await self._select_model_from_nested_picker(target.ui_labels)
+            if selected is not True:
+                self._unavailable_model_keys.add(unavailable_key)
+                await self._dismiss_model_picker()
+                self._handle_model_switch_failure(
+                    f"Could not find ChatGPT model option '{target.ui_label}' "
+                    "in the concrete-model submenu"
+                )
+                return
+
+            self._last_model_label = self._last_concrete_model_label or target.ui_label
+            log.info("Model switched to %s", self._last_model_label)
+
+        if effort:
+            selected_effort = await self._select_reasoning_effort(effort)
+            if not selected_effort:
+                self._handle_model_switch_failure(
+                    f"Could not select a reasoning effort for '{requested_model}'"
+                )
+                return
+            self._last_reasoning_effort = selected_effort
+            if resolved.reasoning_from_model_id and reasoning_effort:
+                log.info(
+                    "Model-id reasoning suffix '%s' overrides explicit reasoning_effort=%r",
+                    selected_effort,
+                    reasoning_effort,
+                )
+            log.info("Reasoning effort resolved to %s", selected_effort)
+
+    def _handle_model_switch_failure(self, detail: str) -> None:
+        if Config.CHATGPT_MODEL_SWITCH_STRICT:
+            raise RuntimeError(detail)
+        log.warning("%s; continuing with the current ChatGPT picker state", detail)
 
     # ── Navigation ──────────────────────────────────────────────
 
@@ -451,6 +378,31 @@ class ChatGPTClient:
         3. Full page.goto() (last resort - may fail with DNS errors)
         """
         log.info("Starting new chat...")
+        project_url = Config.chatgpt_project_url()
+        if project_url:
+            current_url = (self._page.url or "").split("?", 1)[0].rstrip("/")
+            if current_url == project_url:
+                try:
+                    turn_count = await self._page.evaluate(
+                        "document.querySelectorAll('[data-testid^=\"conversation-turn-\"]').length"
+                    )
+                    if turn_count == 0:
+                        await self._wait_for_chat_input()
+                        log.info("Already on a fresh chat in the configured project")
+                        return
+                except Exception:
+                    pass
+
+            # The project root is itself the project's fresh-chat composer.
+            # Never fall back to the global New Chat button when scoping is set.
+            log.info("Starting new chat in configured ChatGPT project")
+            await self._page.goto(project_url, wait_until="domcontentloaded", timeout=30000)
+            page_error = await self._detect_page_error()
+            if page_error:
+                raise RuntimeError(f"Could not open configured ChatGPT project: {page_error}")
+            await self._wait_for_chat_input()
+            return
+
         # Already on a fresh chat — nothing to do
         if "chatgpt.com" in self._page.url:
             try:
@@ -544,7 +496,12 @@ class ChatGPTClient:
 
     async def navigate_to_thread(self, thread_id: str) -> None:
         """Navigate to an existing conversation thread."""
-        url = f"{Config.CHATGPT_URL}/c/{thread_id}"
+        project_url = Config.chatgpt_project_url()
+        if project_url:
+            project_base = project_url[: -len("/project")]
+            url = f"{project_base}/c/{thread_id}"
+        else:
+            url = f"{Config.CHATGPT_URL.rstrip('/')}/c/{thread_id}"
         log.info(f"Navigating to thread: {thread_id}")
         await self._page.goto(url, wait_until="domcontentloaded")
         await random_delay(1500, 3000)
@@ -933,1075 +890,385 @@ class ChatGPTClient:
         return False
 
     async def _detect_current_model_label(self) -> str:
-        """Best-effort detection of the currently selected ChatGPT model label."""
-        known_labels = [
-            label
-            for option in list_switchable_models()
-            for label in self._model_confirmation_labels(option, self._model_setting_label_for_option(option))
-        ]
-        if self._last_model_label and self._last_model_label not in known_labels:
-            known_labels.append(self._last_model_label)
-        if not known_labels:
+        """Read the composer pill (usually an intelligence label, not a model)."""
+        try:
+            return await self._page.evaluate(
+                r"""
+                () => {
+                    const el = document.querySelector(
+                        "main button.__composer-pill[aria-haspopup='menu'],"
+                        + "button[data-testid='model-switcher-dropdown-button']"
+                    );
+                    return el ? (el.innerText || el.textContent || "").trim() : "";
+                }
+                """
+            )
+        except Exception as exc:
+            log.debug("Could not read composer model pill: %s", exc)
             return ""
 
-        label = await self._page.evaluate(
-            r"""
-            (knownLabels) => {
-                const normalize = (value) =>
-                    (value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
-                const isVisible = (el) => {
-                    if (!el) return false;
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return rect.width > 0 &&
-                        rect.height > 0 &&
-                        style.visibility !== "hidden" &&
-                        style.display !== "none";
-                };
-                const wanted = (knownLabels || []).map((label) => ({
-                    label,
-                    normalized: normalize(label),
-                })).filter((item) => item.normalized);
-                const clickable = Array.from(document.querySelectorAll("button,[role='button'],[role='tab']"));
-                const matches = [];
-                for (const el of clickable) {
-                    if (!isVisible(el)) continue;
-                    const rect = el.getBoundingClientRect();
-                    const primaryText = ((el.innerText || el.textContent || "")
-                        .split(/\n+/)
-                        .map((part) => part.trim())
-                        .filter(Boolean)[0] || "").trim();
-                    const rawText = [
-                        primaryText,
-                        el.innerText || "",
-                        el.textContent || "",
-                        el.getAttribute("aria-label") || "",
-                        el.getAttribute("title") || "",
-                    ].join(" ").trim();
-                    const normalizedText = normalize(rawText);
-                    const normalizedPrimary = normalize(primaryText);
-                    if (!normalizedText) continue;
-                    for (const wantedLabel of wanted) {
-                        if (!normalizedText.includes(wantedLabel.normalized)) continue;
-                        let score = 0;
-                        if (normalizedPrimary === wantedLabel.normalized) score += 70;
-                        else if (normalizedText === wantedLabel.normalized) score += 50;
-                        else if (normalizedPrimary.startsWith(wantedLabel.normalized)) score += 35;
-                        else if (normalizedText.startsWith(wantedLabel.normalized)) score += 25;
-                        else score += 10;
-                        score += Math.min(10, wantedLabel.normalized.length);
-                        if (rect.top < 260) score += 20;
-                        if (rect.left < 500) score += 10;
-                        matches.push({
-                            label: wantedLabel.label,
-                            score,
-                            top: rect.top,
-                            left: rect.left,
-                        });
-                    }
-                }
-                matches.sort((a, b) => b.score - a.score || a.top - b.top || a.left - b.left);
-                return matches.length ? matches[0].label : "";
-            }
-            """,
-            known_labels,
-        )
-        return (label or "").strip()
-
-    def _handle_model_switch_failure(self, detail: str) -> None:
-        """Either raise or continue when the requested ChatGPT UI model is unavailable."""
-        if Config.CHATGPT_MODEL_SWITCH_STRICT:
-            raise RuntimeError(detail)
-
-        log.warning(
-            "%s; continuing with the currently selected ChatGPT model "
-            "(set CHATGPT_MODEL_SWITCH_STRICT=true to fail instead)",
-            detail,
-        )
-
-    def _model_version_label_for_option(self, option) -> str:
-        """Return the Configure-dialog version label implied by a model option."""
-        public_id = (getattr(option, "public_id", "") or "").strip().lower()
-        match = re.match(r"gpt-(\d+)\.(\d+)", public_id)
-        if match:
-            return f"{match.group(1)}.{match.group(2)}"
-        if re.match(r"o\d+", public_id):
-            return public_id.split("-", 1)[0]
-        return ""
-
-    def _model_version_is_current(self, target_version_label: str) -> bool:
-        """Return whether the last configured model version matches the target."""
-        target = normalize_model_token(target_version_label)
-        current = normalize_model_token(self._last_model_version_label)
-        return bool(target and current and target == current)
-
-    def _model_setting_label_for_option(self, option) -> str:
-        """Return the configured Standard/Extended picker setting for a model option."""
-        return (getattr(option, "setting_label", "") or "").strip()
-
-    def _model_setting_cache_key(self, option) -> str:
-        """Return the stable key used to remember a model's selected picker setting."""
-        return normalize_model_token(getattr(option, "public_id", "") or getattr(option, "ui_label", ""))
-
-    def _model_setting_is_current(self, option, target_setting_label: str) -> bool:
-        """Return whether the requested model setting was already selected."""
-        target = normalize_model_token(target_setting_label)
-        if not target:
-            return True
-        current = normalize_model_token(self._last_model_setting_by_key.get(self._model_setting_cache_key(option), ""))
-        return bool(current and current == target)
-
-    def _model_confirmation_labels(self, option, target_setting_label: str = "") -> tuple[str, ...]:
-        """Return visible labels that can confirm a successful model switch."""
-        labels = list(getattr(option, "ui_labels", ()) or ())
-        if target_setting_label:
-            labels.insert(0, target_setting_label)
-        return self._dedupe_model_labels(labels)
-
-    def _model_setting_control_labels(self, option) -> tuple[str, ...]:
-        """Return row labels to use when opening a model row's settings control."""
-        labels = list(getattr(option, "ui_labels", ()) or ())
-        public_id = (getattr(option, "public_id", "") or "").lower()
-        if public_id.endswith("-thinking"):
-            labels.insert(0, "Thinking")
-        elif public_id.endswith("-pro"):
-            labels.insert(0, "Pro")
-        return self._dedupe_model_labels(labels)
-
-    def _dedupe_model_labels(self, labels: list[str] | tuple[str, ...]) -> tuple[str, ...]:
-        """Return labels in order with normalized duplicates removed."""
-        seen: set[str] = set()
-        result: list[str] = []
-        for label in labels:
-            normalized = normalize_model_token(label)
-            if not normalized or normalized in seen:
-                continue
-            seen.add(normalized)
-            result.append(label)
-        return tuple(result)
-
-    def _model_version_needs_configure(self, option, target_version_label: str) -> bool:
-        """
-        Return whether a matching visible mode label is insufficient.
-
-        ChatGPT's composer can show only the mode, e.g. `Instant`, while the
-        configured model version inside Configure is `5.4`. For versioned
-        public ids, confirm Configure at least once per process unless we
-        already selected the same version.
-        """
-        if not target_version_label:
-            return False
-        if self._model_version_is_current(target_version_label):
-            return False
-        primary = normalize_model_token(getattr(option, "ui_label", ""))
-        target_version = normalize_model_token(target_version_label)
-        return primary != target_version
-
-    def _is_configure_only_version_option(self, option, target_version_label: str) -> bool:
-        """
-        Return whether the requested option is a version selected inside Configure.
-
-        ChatGPT can keep showing a top-level mode label after selecting a concrete
-        version from Configure, so pure version requests confirm by configured
-        version rather than by the composer button text.
-        """
-        target_version = normalize_model_token(target_version_label)
-        primary = normalize_model_token(getattr(option, "ui_label", ""))
-        return bool(target_version and primary == target_version)
-
     async def _dismiss_model_picker(self) -> None:
-        """Close any open model picker menu/dialog before interacting with the composer."""
         for _ in range(2):
             try:
                 await self._page.keyboard.press("Escape")
-                await asyncio.sleep(0.1)
             except Exception:
-                break
+                return
+            await asyncio.sleep(0.05)
 
-    async def _collect_visible_model_options(self) -> list[str]:
-        """Return visible model-like labels from the currently open picker/dialog."""
+    async def _nested_model_picker_state(self) -> dict:
+        """Inspect the open nested picker through roles and ARIA linkage."""
         try:
-            labels = await self._page.evaluate(
+            state = await self._page.evaluate(
                 r"""
                 () => {
-                    const isVisible = (el) => {
+                    const visible = (el) => {
                         if (!el) return false;
                         const rect = el.getBoundingClientRect();
-                        const style = window.getComputedStyle(el);
-                        return rect.width > 0 &&
-                            rect.height > 0 &&
-                            style.visibility !== "hidden" &&
-                            style.display !== "none";
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0
+                            && style.display !== "none" && style.visibility !== "hidden";
                     };
-                    const selectors = [
-                        "[role='menuitemradio']",
-                        "[role='menuitem']",
-                        "[role='option']",
-                        "[role='radio']",
-                        "[role='combobox']",
-                        "[data-radix-collection-item]",
-                        "button",
-                        "li",
-                    ];
-                    const seen = new Set();
-                    const labels = [];
-                    const modelish = /(gpt|claude|o[0-9]|instant|thinking|latest|model|mini|nano|5\.[0-9]|4\.[0-9])/i;
-                    for (const selector of selectors) {
-                        for (const el of document.querySelectorAll(selector)) {
-                            if (!isVisible(el)) continue;
-                            const text = ((el.innerText || el.textContent || "")
-                                .split(/\n+/)
-                                .map((part) => part.trim())
-                                .filter(Boolean)[0] || "").trim();
-                            if (!text || text.length > 80 || !modelish.test(text)) continue;
-                            const key = text.toLowerCase().replace(/\s+/g, " ");
-                            if (seen.has(key)) continue;
-                            seen.add(key);
-                            labels.push(text);
-                            if (labels.length >= 20) return labels;
+                    const primaryText = (el) => {
+                        const primary = el.querySelector(".truncate");
+                        if (primary && (primary.innerText || "").trim()) {
+                            return primary.innerText.trim();
                         }
-                    }
-                    return labels;
+                        const first = Array.from(el.children).find(
+                            (child) => (child.innerText || "").trim()
+                        );
+                        const raw = first
+                            ? first.innerText
+                            : (el.getAttribute("aria-label") || el.innerText || el.textContent || "");
+                        return raw.trim().split(/\n+/)[0].trim();
+                    };
+                    const rowInfo = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        return {
+                            label: primaryText(el),
+                            text: (el.innerText || el.textContent || "").trim().replace(/\s+/g, " "),
+                            ariaChecked: el.getAttribute("aria-checked"),
+                            state: el.getAttribute("data-state"),
+                            checked: el.getAttribute("aria-checked") === "true"
+                                && el.getAttribute("data-state") === "checked",
+                            x: rect.left + rect.width / 2,
+                            y: rect.top + rect.height / 2,
+                        };
+                    };
+                    const menus = Array.from(document.querySelectorAll("[role='menu']"))
+                        .filter(visible);
+                    const topMenu = menus.find((menu) =>
+                        menu.querySelector(
+                            "[role='menuitem'][aria-haspopup='menu'][data-has-submenu]"
+                        )
+                    ) || null;
+                    const opener = topMenu
+                        ? topMenu.querySelector(
+                            "[role='menuitem'][aria-haspopup='menu'][data-has-submenu]"
+                        )
+                        : null;
+                    const submenu = opener && opener.id
+                        ? menus.find((menu) => menu.getAttribute("aria-labelledby") === opener.id)
+                        : null;
+                    const openerRect = opener ? opener.getBoundingClientRect() : null;
+                    return {
+                        topMenuOpen: Boolean(topMenu),
+                        submenuOpen: Boolean(submenu),
+                        opener: opener && openerRect ? {
+                            id: opener.id,
+                            label: primaryText(opener),
+                            state: opener.getAttribute("data-state"),
+                            expanded: opener.getAttribute("aria-expanded"),
+                            x: openerRect.left + openerRect.width / 2,
+                            y: openerRect.top + openerRect.height / 2,
+                        } : null,
+                        reasoning: topMenu
+                            ? Array.from(topMenu.querySelectorAll("[role='menuitemradio']"))
+                                .filter(visible).map(rowInfo)
+                            : [],
+                        models: submenu
+                            ? Array.from(submenu.querySelectorAll("[role='menuitemradio']"))
+                                .filter(visible).map(rowInfo)
+                            : [],
+                    };
                 }
                 """
             )
-        except Exception as e:
-            log.debug(f"Could not collect visible model options: {e}")
-            return []
-
-        if not isinstance(labels, list):
-            return []
-        return [str(label).strip() for label in labels if str(label).strip()]
+            return state if isinstance(state, dict) else {}
+        except Exception as exc:
+            log.debug("Could not inspect nested model picker: %s", exc)
+            return {}
 
     async def _model_picker_is_open(self) -> bool:
-        """Return whether a model picker/menu is visibly open."""
-        try:
-            open_ = await self._page.evaluate(
-                r"""
-                () => {
-                    const isVisible = (el) => {
-                        if (!el) return false;
-                        const rect = el.getBoundingClientRect();
-                        const style = window.getComputedStyle(el);
-                        return rect.width > 0 &&
-                            rect.height > 0 &&
-                            style.visibility !== "hidden" &&
-                            style.display !== "none";
-                    };
-                    const modelish = /(gpt|o[0-9]|instant|thinking|latest|model|more|configure|5\.[0-9]|4\.[0-9])/i;
-                    const selectors = [
-                        "[role='menuitemradio']",
-                        "[role='menuitem']",
-                        "[role='option']",
-                        "[role='radio']",
-                        "[data-radix-collection-item]",
-                    ];
-                    for (const selector of selectors) {
-                        for (const el of document.querySelectorAll(selector)) {
-                            if (!isVisible(el)) continue;
-                            const text = [
-                                el.innerText || "",
-                                el.textContent || "",
-                                el.getAttribute("aria-label") || "",
-                                el.getAttribute("title") || "",
-                                el.getAttribute("data-testid") || "",
-                            ].join(" ");
-                            if (modelish.test(text)) return true;
-                        }
-                    }
-                    return false;
-                }
-                """
-            )
-            return bool(open_)
-        except Exception as e:
-            log.debug(f"Could not check model picker open state: {e}")
-            return False
+        return bool((await self._nested_model_picker_state()).get("topMenuOpen"))
 
-    async def _open_model_picker(self, target_label: str, current_label: str = "") -> bool:
-        """Open ChatGPT's model picker using the visible current-model button."""
-        for selector in Selectors.MODEL_PICKER_BUTTON:
-            try:
-                el = await self._page.wait_for_selector(selector, timeout=1000, state="visible")
-                if el:
-                    await human_click(self._page, selector)
-                    await asyncio.sleep(0.25)
-                    if await self._model_picker_is_open():
-                        return True
-            except Exception:
-                continue
-
-        hints = [
-            current_label,
-            self._last_model_label,
-            target_label,
-            "Instant",
-            "Thinking",
-            "Latest",
-            "Standard",
-            "Extended",
-            "Configure",
-            "model",
-            "GPT",
-            "o3",
-            "o4",
-        ]
-        if await self._click_model_picker_button_by_text(hints):
-            await asyncio.sleep(0.25)
-            return await self._model_picker_is_open()
-
-        return False
-
-    async def _click_model_picker_button_by_text(self, hints: list[str]) -> bool:
-        """Click the ChatGPT model picker trigger by current/target model text."""
-        filtered_hints = [hint for hint in hints if (hint or "").strip()]
-        if not filtered_hints:
-            return False
-
-        candidate = await self._page.evaluate(
-            r"""
-            (hints) => {
-                const normalize = (value) =>
-                    (value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
-                const wanted = (hints || []).map(normalize).filter(Boolean);
-                const modelish = /(gpt|o[0-9]|instant|thinking|latest|auto|model|mini|nano|5\.[0-9]|4\.[0-9])/i;
-                const isVisible = (el) => {
-                    if (!el) return false;
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return rect.width > 0 &&
-                        rect.height > 0 &&
-                        style.visibility !== "hidden" &&
-                        style.display !== "none";
-                };
-                const isInsideSidebar = (el) => Boolean(el.closest(
-                    "nav, aside, [data-testid='sidebar'], [data-testid*='history' i]"
-                ));
-                const clickable = Array.from(document.querySelectorAll([
-                    "button",
-                    "[role='button']",
-                    "[aria-haspopup='menu']",
-                    "[data-testid*='model' i]",
-                ].join(",")));
-                const matches = [];
-                for (const el of clickable) {
-                    if (!isVisible(el)) continue;
-                    const rect = el.getBoundingClientRect();
-                    if (rect.top < 0 || rect.top > window.innerHeight - 40) continue;
-                    if (rect.left < 240 && isInsideSidebar(el)) continue;
-
-                    const primaryText = ((el.innerText || el.textContent || "")
-                        .split(/\n+/)
-                        .map((part) => part.trim())
-                        .filter(Boolean)[0] || "").trim();
-                    const text = [
-                        primaryText,
-                        el.innerText || "",
-                        el.textContent || "",
-                        el.getAttribute("aria-label") || "",
-                        el.getAttribute("title") || "",
-                        el.getAttribute("data-testid") || "",
-                    ].join(" ").trim();
-                    const normalizedText = normalize(text);
-                    const normalizedPrimary = normalize(primaryText);
-                    if (!normalizedText) continue;
-
-                    let score = 0;
-                    for (const hint of wanted) {
-                        if (!normalizedText.includes(hint)) continue;
-                        score = Math.max(
-                            score,
-                            normalizedPrimary === hint
-                                ? 90
-                                : normalizedText === hint
-                                  ? 75
-                                  : normalizedPrimary.startsWith(hint)
-                                    ? 60
-                                    : normalizedText.startsWith(hint)
-                                      ? 50
-                                      : 25,
-                        );
-                    }
-                    if (modelish.test(text)) score += 25;
-                    if ((el.getAttribute("aria-haspopup") || "").toLowerCase() === "menu") score += 40;
-                    if ((el.getAttribute("data-testid") || "").toLowerCase().includes("model")) score += 35;
-                    if (rect.left > 240) score += 15;
-                    if (rect.top < 120 || rect.top > window.innerHeight / 2) score += 10;
-
-                    if (score < 35) continue;
-                    matches.push({
-                        score,
-                        top: rect.top,
-                        left: rect.left,
-                        x: rect.left + rect.width / 2,
-                        y: rect.top + rect.height / 2,
-                        label: primaryText,
-                    });
-                }
-                matches.sort((a, b) => b.score - a.score || b.left - a.left || a.top - b.top);
-                return matches[0] || null;
-            }
-            """,
-            filtered_hints,
-        )
-        if not isinstance(candidate, dict) or "x" not in candidate or "y" not in candidate:
-            return False
-
-        await self._page.mouse.move(float(candidate["x"]), float(candidate["y"]), steps=8)
-        await asyncio.sleep(0.05)
-        await self._page.mouse.click(float(candidate["x"]), float(candidate["y"]))
-        return True
-
-    async def _click_top_button_by_text(self, hints: list[str]) -> bool:
-        """Click a visible top-of-page button whose label best matches the hints."""
-        filtered_hints = [hint for hint in hints if (hint or "").strip()]
-        if not filtered_hints:
-            return False
-
-        candidate = await self._page.evaluate(
-            r"""
-            (hints) => {
-                const normalize = (value) =>
-                    (value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
-                const wanted = (hints || []).map(normalize).filter(Boolean);
-                const isVisible = (el) => {
-                    if (!el) return false;
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return rect.width > 0 &&
-                        rect.height > 0 &&
-                        style.visibility !== "hidden" &&
-                        style.display !== "none";
-                };
-                const clickable = Array.from(document.querySelectorAll("button,[role='button'],[role='tab']"));
-                const matches = [];
-                for (const el of clickable) {
-                    if (!isVisible(el)) continue;
-                    const rect = el.getBoundingClientRect();
-                    if (rect.top > 320) continue;
-                    const primaryText = ((el.innerText || el.textContent || "")
-                        .split(/\n+/)
-                        .map((part) => part.trim())
-                        .filter(Boolean)[0] || "").trim();
-                    const text = [
-                        primaryText,
-                        el.innerText || "",
-                        el.textContent || "",
-                        el.getAttribute("aria-label") || "",
-                        el.getAttribute("title") || "",
-                    ].join(" ").trim();
-                    const normalizedText = normalize(text);
-                    const normalizedPrimary = normalize(primaryText);
-                    if (!normalizedText) continue;
-                    let score = 0;
-                    for (const hint of wanted) {
-                        if (!normalizedText.includes(hint)) continue;
-                        score = Math.max(
-                            score,
-                            normalizedPrimary === hint
-                                ? 70
-                                : normalizedText === hint
-                                  ? 60
-                                  : normalizedPrimary.startsWith(hint)
-                                    ? 45
-                                    : normalizedText.startsWith(hint)
-                                      ? 40
-                                      : 20,
-                        );
-                    }
-                    if (!score) continue;
-                    if (el.getAttribute("aria-haspopup")) score += 15;
-                    if (rect.left < 500) score += 10;
-                    matches.push({
-                        score,
-                        top: rect.top,
-                        left: rect.left,
-                        x: rect.left + rect.width / 2,
-                        y: rect.top + rect.height / 2,
-                    });
-                }
-                matches.sort((a, b) => b.score - a.score || a.top - b.top || a.left - b.left);
-                const best = matches[0];
-                return best || null;
-            }
-            """,
-            filtered_hints,
-        )
-        if not isinstance(candidate, dict) or "x" not in candidate or "y" not in candidate:
-            return False
-
-        await self._page.mouse.move(float(candidate["x"]), float(candidate["y"]), steps=8)
-        await asyncio.sleep(0.05)
-        await self._page.mouse.click(float(candidate["x"]), float(candidate["y"]))
-        return True
-
-    async def _click_model_option(self, target_labels: tuple[str, ...]) -> bool:
-        """Click a visible model option in an open picker/menu by its label."""
-        for target_label in target_labels:
-            if await self._click_menu_text(target_label):
+    async def _open_model_picker(self, *_args, **_kwargs) -> bool:
+        deadline = time.time() + Config.CHATGPT_MODEL_SWITCH_TIMEOUT / 1000.0
+        while time.time() < deadline:
+            if await self._model_picker_is_open():
                 return True
+            for selector in Selectors.MODEL_PICKER_BUTTON:
+                try:
+                    for element in await self._page.query_selector_all(selector):
+                        if await element.is_visible():
+                            await element.click()
+                            await asyncio.sleep(0.1)
+                            if await self._model_picker_is_open():
+                                return True
+                except Exception as exc:
+                    log.debug("Model picker selector failed (%s): %s", selector, exc)
+            await asyncio.sleep(0.15)
         return False
 
-    async def _ensure_model_setting(self, option, setting_label: str) -> bool | None:
-        """Open a model row's settings submenu and select Standard/Extended."""
-        await self._dismiss_model_picker()
-        current_label = await self._detect_current_model_label()
-        opened = await self._open_model_picker(option.ui_label, current_label=current_label)
-        if not opened:
-            return False
-
-        await asyncio.sleep(0.3)
-        settings_opened = await self._click_model_setting_control(self._model_setting_control_labels(option))
-        if not settings_opened:
-            target_version_label = self._model_version_label_for_option(option)
-            if target_version_label:
-                configured = await self._ensure_configured_model_setting(option, setting_label, target_version_label)
-                if configured:
-                    return True
-                current_label = await self._detect_current_model_label()
-                if self._label_matches_model_option(current_label, option):
-                    log.warning(
-                        "ChatGPT model setting '%s -> %s' was not visible; continuing with selected model",
-                        option.ui_label,
-                        setting_label,
-                    )
-                    return None
-                return False
-            return False
-
-        await asyncio.sleep(0.3)
-        if await self._click_model_option((setting_label,)):
-            return True
-
-        target_version_label = self._model_version_label_for_option(option)
-        if target_version_label:
-            configured = await self._ensure_configured_model_setting(option, setting_label, target_version_label)
-            if configured:
-                return True
-            current_label = await self._detect_current_model_label()
-            if self._label_matches_model_option(current_label, option):
-                log.warning(
-                    "ChatGPT model setting '%s -> %s' was not visible; continuing with selected model",
-                    option.ui_label,
-                    setting_label,
-                )
-                return None
-
-        return False
-
-    async def _ensure_configured_model_setting(
-        self,
-        option,
-        setting_label: str,
-        target_version_label: str,
-    ) -> bool:
-        """Open Configure and set Standard/Extended for a versioned Thinking/Pro row."""
-        await self._dismiss_model_picker()
-        current_label = await self._detect_current_model_label()
-        opened = await self._open_model_picker(option.ui_label, current_label=current_label)
-        if not opened:
-            return False
-
-        await asyncio.sleep(0.3)
-        configure_opened = await self._click_menu_text("Configure")
-        if not configure_opened:
-            return False
-
-        await asyncio.sleep(0.5)
-        dropdown_opened = await self._click_configure_model_combobox()
-        if dropdown_opened:
-            await asyncio.sleep(0.3)
-            version_labels = self._configure_version_click_labels(option.ui_labels, target_version_label)
-            await self._click_model_option(version_labels)
-            await asyncio.sleep(0.4)
-
-        settings_opened = await self._click_model_setting_control(self._model_setting_control_labels(option))
-        if not settings_opened:
-            return False
-
-        await asyncio.sleep(0.3)
-        return await self._click_model_option((setting_label,))
-
-    async def _click_model_setting_control(self, target_labels: tuple[str, ...]) -> bool:
-        """Click the settings control beside a Thinking/Pro model row."""
-        labels = [label for label in target_labels if (label or "").strip()]
-        if not labels:
-            return False
-
-        row = await self._page.evaluate(
-            r"""
-            (targetLabels) => {
-                const normalize = (value) =>
-                    (value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
-                const wanted = (targetLabels || []).map(normalize).filter(Boolean);
-                if (!wanted.length) return null;
-                const isVisible = (el) => {
-                    if (!el) return false;
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return rect.width > 0 &&
-                        rect.height > 0 &&
-                        style.visibility !== "hidden" &&
-                        style.display !== "none";
-                };
-                const textFor = (el) => [
-                    el.innerText || "",
-                    el.textContent || "",
-                    el.getAttribute("aria-label") || "",
-                    el.getAttribute("title") || "",
-                ].join(" ");
-                const selectors = [
-                    "[role='menuitemradio']",
-                    "[role='menuitem']",
-                    "[role='radio']",
-                    "[data-testid^='model-switcher']",
-                    "[data-radix-collection-item]",
-                ];
-                const rows = [];
-                for (const selector of selectors) {
-                    for (const el of document.querySelectorAll(selector)) {
-                        if (!isVisible(el)) continue;
-                        const normalizedText = normalize(textFor(el));
-                        if (!normalizedText || !wanted.some((label) => normalizedText.includes(label))) continue;
-                        const rect = el.getBoundingClientRect();
-                        if (rect.width < 40 || rect.height < 20 || rect.top > window.innerHeight - 24) continue;
-                        rows.push({ el, rect });
-                    }
-                }
-                rows.sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left);
-                if (rows[0]) {
-                    const rect = rows[0].rect;
-                    return {
-                        left: rect.left,
-                        top: rect.top,
-                        width: rect.width,
-                        height: rect.height,
-                        x: Math.max(rect.left + rect.width - 18, rect.left + rect.width * 0.75),
-                        y: rect.top + rect.height / 2,
-                    };
-                }
-                return null;
-            }
-            """,
-            labels,
-        )
+    async def _click_picker_row(self, row: dict) -> bool:
         if not isinstance(row, dict) or "x" not in row or "y" not in row:
             return False
-
-        await self._page.mouse.move(float(row["x"]), float(row["y"]), steps=8)
-        await asyncio.sleep(0.25)
-
-        candidate = await self._page.evaluate(
-            r"""
-            (row) => {
-                const normalize = (value) =>
-                    (value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
-                const isVisible = (el) => {
-                    if (!el) return false;
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return rect.width > 0 &&
-                        rect.height > 0 &&
-                        style.visibility !== "hidden" &&
-                        style.display !== "none";
-                };
-                const textFor = (el) => [
-                    el.innerText || "",
-                    el.textContent || "",
-                    el.getAttribute("aria-label") || "",
-                    el.getAttribute("title") || "",
-                    el.getAttribute("data-testid") || "",
-                ].join(" ");
-                const rowRight = row.left + row.width;
-                const rowBottom = row.top + row.height;
-                const controls = Array.from(document.querySelectorAll("button,[role='button'],[aria-label],[title],[data-testid]"))
-                    .filter((el) => {
-                        if (!isVisible(el)) return false;
-                        const rect = el.getBoundingClientRect();
-                        const centerY = rect.top + rect.height / 2;
-                        return centerY >= row.top - 6 &&
-                            centerY <= rowBottom + 6 &&
-                            rect.left >= row.left + row.width * 0.45 &&
-                            rect.left <= rowRight + 48;
-                    });
-                const scored = [];
-                for (const control of controls) {
-                    const rect = control.getBoundingClientRect();
-                    const text = normalize(textFor(control));
-                    let score = 0;
-                    if (/settings|setting|customize|preferences|options|sliders|model/.test(text)) score += 80;
-                    if (rect.width <= 48 && rect.height <= 48) score += 25;
-                    if (rect.left >= row.left + row.width * 0.6) score += 25;
-                    if (score) {
-                        scored.push({
-                            score,
-                            x: rect.left + rect.width / 2,
-                            y: rect.top + rect.height / 2,
-                        });
-                    }
-                }
-                scored.sort((a, b) => b.score - a.score);
-                return scored[0] || null;
-            }
-            """,
-            row,
-        )
-        if not isinstance(candidate, dict) or "x" not in candidate or "y" not in candidate:
-            return False
-
-        await self._page.mouse.move(float(candidate["x"]), float(candidate["y"]), steps=4)
-        await asyncio.sleep(0.05)
-        await self._page.mouse.click(float(candidate["x"]), float(candidate["y"]))
+        await self._page.mouse.move(float(row["x"]), float(row["y"]), steps=4)
+        await self._page.mouse.click(float(row["x"]), float(row["y"]))
         return True
 
-    async def _select_model_from_configure_dialog(
-        self,
-        target_labels: tuple[str, ...],
-        target_version_label: str = "",
-    ) -> bool:
-        """Select a model from the Pro Intelligence -> Model dropdown dialog."""
-        target_tokens = {normalize_model_token(label) for label in target_labels}
-        if target_version_label:
-            target_tokens.add(normalize_model_token(target_version_label))
-        version_tokens = {
-            token
-            for token in target_tokens
-            if re.match(r"^(5[0-9]+|o[0-9]+)$", token)
-        }
-
-        if version_tokens:
-            dropdown_opened = await self._click_configure_model_combobox()
-            if not dropdown_opened:
-                return False
-
-            await asyncio.sleep(0.4)
-            version_labels = self._configure_version_click_labels(target_labels, target_version_label)
-            version_selected = await self._click_model_option(version_labels)
-            if not version_selected:
-                return False
-
-            await asyncio.sleep(0.4)
-            radio_selected = await self._click_configure_radio_for_version(
-                target_version_label or version_labels[0],
-                target_labels=target_labels,
-            )
-            return radio_selected or version_selected
-
-        return await self._click_model_option(target_labels)
-
-    def _configure_version_click_labels(
-        self,
-        target_labels: tuple[str, ...],
-        target_version_label: str = "",
-    ) -> tuple[str, ...]:
-        """Return labels to try when selecting a concrete model version."""
-        ordered: list[str] = []
-        if target_version_label:
-            ordered.append(target_version_label)
-        for label in target_labels:
-            match = re.search(r"(?:gpt[- ]*)?((?:[45]\.\d+)|o\d+)", label, flags=re.IGNORECASE)
-            if match:
-                ordered.append(match.group(1))
-            ordered.append(label)
-
-        seen: set[str] = set()
-        result: list[str] = []
-        for label in ordered:
-            normalized = normalize_model_token(label)
-            if not normalized or normalized in seen:
-                continue
-            seen.add(normalized)
-            result.append(label)
-        return tuple(result)
-
-    async def _ensure_configured_model_version(self, target_version_label: str) -> bool:
-        """Open Configure and select the requested model-version label."""
-        await self._dismiss_model_picker()
-        current_label = await self._detect_current_model_label()
-        opened = await self._open_model_picker(target_version_label, current_label=current_label)
-        if not opened:
-            return False
-
-        await asyncio.sleep(0.3)
-        configure_opened = await self._click_menu_text("Configure")
-        if not configure_opened:
-            return False
-
-        await asyncio.sleep(0.5)
-        version_configured = await self._select_model_from_configure_dialog(
-            (target_version_label,),
-            target_version_label=target_version_label,
-        )
-        if version_configured:
-            self._last_model_version_label = target_version_label
-        return version_configured
-
-    async def _click_configure_model_combobox(self) -> bool:
-        """Open the model-version combobox in ChatGPT's Configure dialog."""
-        dropdown_candidate = await self._page.evaluate(
-            r"""
-            () => {
-                const normalize = (value) =>
-                    (value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
-                const isVisible = (el) => {
-                    if (!el) return false;
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return rect.width > 0 &&
-                        rect.height > 0 &&
-                        style.visibility !== "hidden" &&
-                        style.display !== "none";
-                };
-                const buttons = Array.from(document.querySelectorAll("[role='combobox'],button,[role='button'],[aria-haspopup]"))
-                    .filter((el) => isVisible(el) && el.closest("[role='dialog'], [aria-modal='true']"));
-                const candidates = [];
-                for (const el of buttons) {
-                    const text = normalize([
-                        el.innerText || "",
-                        el.textContent || "",
-                        el.getAttribute("aria-label") || "",
-                        el.getAttribute("title") || "",
-                    ].join(" "));
-                    const rect = el.getBoundingClientRect();
-                    let score = 0;
-                    if (text.match(/^(5[0-9]*|o[0-9]+)$/)) score += 80;
-                    if ((el.getAttribute("role") || "") === "combobox") score += 120;
-                    if (text.includes("model")) score += 40;
-                    if (el.getAttribute("aria-haspopup")) score += 30;
-                    if (rect.top < 360) score += 20;
-                    if (rect.left > window.innerWidth / 2) score += 20;
-                    if (score) {
-                        candidates.push({
-                            score,
-                            top: rect.top,
-                            left: rect.left,
-                            x: rect.left + rect.width / 2,
-                            y: rect.top + rect.height / 2,
-                        });
-                    }
-                }
-                if (!candidates.length) {
-                    const dialogs = Array.from(document.querySelectorAll("[role='dialog'], [aria-modal='true']"))
-                        .filter(isVisible);
-                    for (const dialog of dialogs) {
-                        const rows = Array.from(dialog.querySelectorAll("div"))
-                            .filter((el) => isVisible(el));
-                        for (const el of rows) {
-                            const rawText = (el.innerText || el.textContent || "").trim();
-                            const text = normalize(rawText);
-                            if (!text.includes("model")) continue;
-                            if (!/(5[0-9]|o[0-9]+)/.test(text)) continue;
-                            const rect = el.getBoundingClientRect();
-                            if (rect.height > 70 || rect.width < 120) continue;
-                            candidates.push({
-                                score: 70,
-                                top: rect.top,
-                                left: rect.left,
-                                x: rect.left + rect.width - 28,
-                                y: rect.top + rect.height / 2,
-                            });
+    async def _click_picker_radio(self, label: str, *, concrete_model: bool) -> bool:
+        """Click an exact radio row inside the ARIA-linked active menu."""
+        return bool(
+            await self._page.evaluate(
+                r"""
+                ({ target, concreteModel }) => {
+                    const normalize = (value) =>
+                        (value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0
+                            && style.display !== "none" && style.visibility !== "hidden";
+                    };
+                    const primaryText = (el) => {
+                        const primary = el.querySelector(".truncate");
+                        if (primary && (primary.innerText || "").trim()) {
+                            return primary.innerText.trim();
                         }
+                        const first = Array.from(el.children).find(
+                            (child) => (child.innerText || "").trim()
+                        );
+                        const raw = first ? first.innerText : (el.innerText || el.textContent || "");
+                        return raw.trim().split(/\n+/)[0].trim();
+                    };
+                    const menus = Array.from(document.querySelectorAll("[role='menu']"))
+                        .filter(visible);
+                    const top = menus.find((menu) => menu.querySelector(
+                        "[role='menuitem'][aria-haspopup='menu'][data-has-submenu]"
+                    ));
+                    if (!top) return false;
+                    let scope = top;
+                    if (concreteModel) {
+                        const opener = top.querySelector(
+                            "[role='menuitem'][aria-haspopup='menu'][data-has-submenu]"
+                        );
+                        scope = opener && opener.id
+                            ? menus.find((menu) => menu.getAttribute("aria-labelledby") === opener.id)
+                            : null;
                     }
+                    if (!scope) return false;
+                    const wanted = normalize(target);
+                    const row = Array.from(scope.querySelectorAll("[role='menuitemradio']"))
+                        .find((item) => visible(item) && normalize(primaryText(item)) === wanted);
+                    if (!row || row.getAttribute("aria-disabled") === "true") return false;
+                    row.click();
+                    return true;
                 }
-                candidates.sort((a, b) => b.score - a.score || a.top - b.top || b.left - a.left);
-                const best = candidates[0];
-                return best || null;
-            }
-            """
+                """,
+                {"target": label, "concreteModel": concrete_model},
+            )
         )
-        if (
-            not isinstance(dropdown_candidate, dict)
-            or "x" not in dropdown_candidate
-            or "y" not in dropdown_candidate
-        ):
-            return False
 
-        await self._page.mouse.move(float(dropdown_candidate["x"]), float(dropdown_candidate["y"]), steps=8)
-        await asyncio.sleep(0.05)
-        await self._page.mouse.click(float(dropdown_candidate["x"]), float(dropdown_candidate["y"]))
-        return True
-
-    async def _click_configure_radio_for_version(
-        self,
-        target_version_token: str,
-        target_labels: tuple[str, ...] = (),
-    ) -> bool:
-        """Click a Configure dialog radio row matching the requested mode/version."""
-        candidate = await self._page.evaluate(
-            r"""
-            ({ targetVersionToken, targetLabels }) => {
-                const normalize = (value) =>
-                    (value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
-                const target = normalize(targetVersionToken);
-                if (!target) return null;
-                const labels = (targetLabels || []).map(normalize).filter(Boolean);
-                const wantsThinking = labels.some((label) => label.includes("thinking"));
-                const wantsPro = labels.some((label) => label.includes("pro"));
-                const wantsInstant = labels.some((label) => label.includes("instant"));
-                const isVisible = (el) => {
-                    if (!el) return false;
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return rect.width > 0 &&
-                        rect.height > 0 &&
-                        style.visibility !== "hidden" &&
-                        style.display !== "none";
-                };
-                const radios = Array.from(document.querySelectorAll("[role='radio']"))
-                    .filter(isVisible);
-                const matches = [];
-                for (const el of radios) {
-                    const text = [
-                        el.innerText || "",
-                        el.textContent || "",
-                        el.getAttribute("aria-label") || "",
-                    ].join(" ");
-                    const normalizedText = normalize(text);
-                    if (!normalizedText.includes(target)) continue;
-                    let score = 10;
-                    if (wantsThinking && normalizedText.includes("thinking")) score += 100;
-                    if (wantsPro && normalizedText.includes("pro")) score += 100;
-                    if (wantsInstant && normalizedText.includes("instant")) score += 100;
-                    if (!wantsThinking && !wantsPro && !wantsInstant && normalizedText.includes("instant")) {
-                        score += 40;
-                    }
-                    const rect = el.getBoundingClientRect();
-                    matches.push({
-                        score,
-                        top: rect.top,
-                        left: rect.left,
-                        x: rect.left + rect.width / 2,
-                        y: rect.top + rect.height / 2,
-                    });
-                }
-                matches.sort((a, b) => b.score - a.score || a.top - b.top || a.left - b.left);
-                return matches[0] || null;
-            }
-            """,
-            {
-                "targetVersionToken": target_version_token,
-                "targetLabels": list(target_labels),
-            },
-        )
-        if not isinstance(candidate, dict) or "x" not in candidate or "y" not in candidate:
-            return False
-
-        await self._page.mouse.move(float(candidate["x"]), float(candidate["y"]), steps=8)
-        await asyncio.sleep(0.05)
-        await self._page.mouse.click(float(candidate["x"]), float(candidate["y"]))
-        return True
-
-    async def _click_menu_text(self, target_text: str) -> bool:
-        """Click a visible menu-style element whose text matches the target."""
-        for role in ("option", "menuitemradio", "menuitem", "radio"):
-            try:
-                locator = self._page.get_by_role(role, name=target_text, exact=True).first
-                if await locator.count() > 0:
-                    await locator.hover()
-                    await asyncio.sleep(0.05)
-                    await locator.click()
-                    return True
-            except Exception:
-                continue
-
-        candidate = await self._page.evaluate(
-            r"""
-            (targetText) => {
-                const normalize = (value) =>
-                    (value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
-                const target = normalize(targetText);
-                if (!target) return false;
-                const isVisible = (el) => {
-                    if (!el) return false;
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return rect.width > 0 &&
-                        rect.height > 0 &&
-                        style.visibility !== "hidden" &&
-                        style.display !== "none";
-                };
-                const selectors = [
-                    "[role='menuitemradio']",
-                    "[role='menuitem']",
-                    "[role='option']",
-                    "[role='radio']",
-                    "[role='button']",
-                    "button",
-                    "[data-radix-collection-item]",
-                    "[cmdk-item]",
-                    "li",
-                    "div",
-                ];
-                const matches = [];
-                for (const selector of selectors) {
-                    for (const el of document.querySelectorAll(selector)) {
-                        if (!isVisible(el)) continue;
-                        const primaryText = ((el.innerText || el.textContent || "")
-                            .split(/\n+/)
-                            .map((part) => part.trim())
-                            .filter(Boolean)[0] || "").trim();
-                        const text = [
-                            primaryText,
-                            el.innerText || "",
-                            el.textContent || "",
-                            el.getAttribute("aria-label") || "",
-                            el.getAttribute("title") || "",
-                        ].join(" ").trim();
-                        const normalizedText = normalize(text);
-                        const normalizedPrimary = normalize(primaryText);
-                        if (!normalizedText || !normalizedText.includes(target)) continue;
-                        let score = 0;
-                        if (normalizedPrimary === target) score += 80;
-                        else if (normalizedText === target) score += 60;
-                        else if (normalizedPrimary.startsWith(target)) score += 45;
-                        else if (normalizedText.startsWith(target)) score += 40;
-                        else score += 20;
-                        const role = el.getAttribute("role") || "";
-                        if (["menuitemradio", "menuitem", "option", "radio"].includes(role)) score += 25;
-                        if ((el.getAttribute("data-testid") || "").includes("model-switcher")) score += 20;
-                        const rect = el.getBoundingClientRect();
-                        if (rect.top < 700) score += 10;
-                        matches.push({
-                            score,
-                            top: rect.top,
-                            left: rect.left,
-                            area: rect.width * rect.height,
-                            x: rect.left + rect.width / 2,
-                            y: rect.top + rect.height / 2,
-                        });
-                    }
-                }
-                matches.sort((a, b) => b.score - a.score || a.area - b.area || a.top - b.top || a.left - b.left);
-                const best = matches[0];
-                return best || null;
-            }
-            """,
-            target_text,
-        )
-        if not isinstance(candidate, dict) or "x" not in candidate or "y" not in candidate:
-            return False
-
-        await self._page.mouse.move(float(candidate["x"]), float(candidate["y"]), steps=8)
-        await asyncio.sleep(0.05)
-        await self._page.mouse.click(float(candidate["x"]), float(candidate["y"]))
-        return True
-
-    async def _wait_for_model_label(self, target_labels: tuple[str, ...]) -> bool:
-        """Wait briefly until the current-model button reflects the requested label."""
-        deadline = time.time() + (Config.CHATGPT_MODEL_SWITCH_TIMEOUT / 1000.0)
+    async def _open_concrete_model_submenu(self) -> dict | None:
+        state = await self._nested_model_picker_state()
+        if state.get("submenuOpen"):
+            return state
+        opener = state.get("opener")
+        if not opener or not await self._click_picker_row(opener):
+            return None
+        deadline = time.time() + Config.CHATGPT_MODEL_SWITCH_TIMEOUT / 1000.0
         while time.time() < deadline:
-            current_label = await self._detect_current_model_label()
-            current_normalized = normalize_model_token(current_label)
-            if current_normalized in {normalize_model_token(label) for label in target_labels}:
+            state = await self._nested_model_picker_state()
+            if state.get("submenuOpen") and state.get("models"):
+                return state
+            await asyncio.sleep(0.1)
+        return None
+
+    def _match_nested_model_label(
+        self,
+        target_labels: tuple[str, ...],
+        available_labels: list[str],
+    ) -> str:
+        wanted_tokens = {normalize_model_token(label) for label in target_labels if label.strip()}
+        for label in available_labels:
+            if normalize_model_token(label) in wanted_tokens:
+                return label
+        wanted_ids = {model_label_to_public_id(label) for label in target_labels if label.strip()}
+        for label in available_labels:
+            if model_label_to_public_id(label) in wanted_ids:
+                return label
+        for wanted_id in wanted_ids:
+            if not re.fullmatch(r"gpt-\d+(?:\.\d+)+", wanted_id):
+                continue
+            matches = [
+                label for label in available_labels
+                if model_label_to_public_id(label).startswith(wanted_id + "-")
+            ]
+            if len(matches) == 1:
+                return matches[0]
+        return ""
+
+    async def _select_model_from_nested_picker(
+        self,
+        target_labels: tuple[str, ...],
+    ) -> bool | None:
+        state = await self._open_concrete_model_submenu()
+        if state is None:
+            return None
+        rows = state.get("models") or []
+        available = [row.get("label", "") for row in rows if row.get("label")]
+        register_discovered_models(available)
+        matched = self._match_nested_model_label(target_labels, available)
+        if not matched:
+            return False
+        row = next(
+            (item for item in rows if normalize_model_token(item.get("label", ""))
+             == normalize_model_token(matched)),
+            None,
+        )
+        if row and row.get("checked"):
+            self._last_concrete_model_label = matched
+            await self._dismiss_model_picker()
+            return True
+        if not row or not await self._click_picker_radio(matched, concrete_model=True):
+            return False
+
+        # Some concrete models take longer to settle than others. Reopen and
+        # verify the authoritative checked radio row until the switch timeout.
+        deadline = time.time() + Config.CHATGPT_MODEL_SWITCH_TIMEOUT / 1000.0
+        while time.time() < deadline:
+            await asyncio.sleep(0.2)
+            if not await self._open_model_picker():
+                continue
+            confirmed = await self._open_concrete_model_submenu()
+            confirmed_row = next(
+                (
+                    item for item in (confirmed or {}).get("models", [])
+                    if normalize_model_token(item.get("label", ""))
+                    == normalize_model_token(matched)
+                ),
+                None,
+            )
+            success = bool(confirmed_row and confirmed_row.get("checked"))
+            await self._dismiss_model_picker()
+            if success:
+                self._last_concrete_model_label = matched
+                log.info("Confirmed concrete model through checked radio row: %s", matched)
                 return True
-            await asyncio.sleep(0.25)
         return False
 
-    def _label_matches_model_option(self, label: str, option) -> bool:
-        """Return whether a visible UI label matches a configured model option."""
-        normalized = normalize_model_token(label)
-        labels = self._model_confirmation_labels(option, self._model_setting_label_for_option(option))
-        return bool(normalized and normalized in {normalize_model_token(item) for item in labels})
+    async def _select_reasoning_effort(self, requested_effort: str) -> str:
+        await self._dismiss_model_picker()
+        if not await self._open_model_picker():
+            return ""
+        state = await self._nested_model_picker_state()
+        rows = state.get("reasoning") or []
+        labels = [row.get("label", "") for row in rows if row.get("label")]
+        model_label = (state.get("opener") or {}).get("label") or self._last_concrete_model_label
+        if model_label:
+            register_discovered_models([model_label])
+            register_discovered_reasoning(model_label, labels)
+
+        target_label, selected_effort = choose_reasoning_label(requested_effort, labels)
+        row = next(
+            (item for item in rows if normalize_model_token(item.get("label", ""))
+             == normalize_model_token(target_label)),
+            None,
+        )
+        if not target_label or not row:
+            await self._dismiss_model_picker()
+            return ""
+        if row.get("checked"):
+            await self._dismiss_model_picker()
+            return selected_effort
+        if not await self._click_picker_radio(target_label, concrete_model=False):
+            await self._dismiss_model_picker()
+            return ""
+
+        await asyncio.sleep(0.2)
+        if not await self._open_model_picker():
+            return ""
+        confirmed = await self._nested_model_picker_state()
+        confirmed_row = next(
+            (
+                item for item in confirmed.get("reasoning", [])
+                if normalize_model_token(item.get("label", "")) == normalize_model_token(target_label)
+            ),
+            None,
+        )
+        await self._dismiss_model_picker()
+        return selected_effort if confirmed_row and confirmed_row.get("checked") else ""
+
+    async def discover_available_models(self, force: bool = False) -> list[str]:
+        """Discover concrete models and every model-specific reasoning row."""
+        if self._model_capabilities_complete and not force:
+            return list(self._discovered_model_labels)
+
+        await self._dismiss_model_picker()
+        if not await self._open_model_picker():
+            return []
+        initial = await self._open_concrete_model_submenu()
+        if not initial:
+            await self._dismiss_model_picker()
+            return []
+
+        labels = [row.get("label", "") for row in initial.get("models", []) if row.get("label")]
+        initial_model = next(
+            (row.get("label", "") for row in initial.get("models", []) if row.get("checked")),
+            "",
+        )
+        initial_reasoning = next(
+            (row.get("label", "") for row in initial.get("reasoning", []) if row.get("checked")),
+            "",
+        )
+        register_discovered_models(labels)
+        await self._dismiss_model_picker()
+
+        for label in labels:
+            if normalize_model_token(label) != normalize_model_token(self._last_concrete_model_label):
+                if not await self._open_model_picker():
+                    log.warning("Capability discovery could not open picker for %s", label)
+                    continue
+                selection = await self._select_model_from_nested_picker((label,))
+                if selection is not True:
+                    log.warning(
+                        "Capability discovery could not confirm model %s (result=%r)",
+                        label,
+                        selection,
+                    )
+                    await self._dismiss_model_picker()
+                    continue
+            if not await self._open_model_picker():
+                log.warning("Capability discovery could not inspect reasoning rows for %s", label)
+                continue
+            state = await self._nested_model_picker_state()
+            register_discovered_reasoning(
+                label,
+                [row.get("label", "") for row in state.get("reasoning", []) if row.get("label")],
+            )
+            self._last_concrete_model_label = label
+            await self._dismiss_model_picker()
+
+        if initial_model:
+            if await self._open_model_picker():
+                await self._select_model_from_nested_picker((initial_model,))
+            if initial_reasoning:
+                await self._select_reasoning_effort(initial_reasoning)
+
+        self._discovered_model_labels = list(dict.fromkeys(labels))
+        self._model_capabilities_complete = bool(labels)
+        return list(self._discovered_model_labels)
 
     async def _upload_files(self, file_paths: list[str]) -> None:
         """

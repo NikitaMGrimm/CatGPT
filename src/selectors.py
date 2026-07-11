@@ -30,12 +30,8 @@ class Selectors:
 
     # Model picker trigger in ChatGPT's composer/header.
     MODEL_PICKER_BUTTON = [
+        "main button.__composer-pill[aria-haspopup='menu']",
         "button[data-testid='model-switcher-dropdown-button']",
-        "button[aria-haspopup='menu']:has-text('Instant')",
-        "button[aria-haspopup='menu']:has-text('Thinking')",
-        "button[aria-haspopup='menu']:has-text('Auto')",
-        "button[aria-haspopup='menu']:has-text('5.')",
-        "button[aria-haspopup='menu']:has-text('GPT')",
     ]
 
     # ── Assistant response messages ─────────────────────────────
@@ -66,8 +62,8 @@ class Selectors:
 
     # ── Sidebar conversation links ──────────────────────────────
     SIDEBAR_THREAD_LINKS = [
-        "nav a[href^='/c/']",
-        "a[href^='/c/']",
+        "nav a[href*='/c/']",
+        "a[href*='/c/']",
     ]
 
     # ── Login page detection (if any of these appear, user is logged out) ──

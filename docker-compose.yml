@@ -32,6 +32,7 @@ services:
       DISPLAY_DEPTH: 24
       # ChatGPT
       CHATGPT_URL: "https://chatgpt.com"
+      CHATGPT_PROJECT_URL: "${CHATGPT_PROJECT_URL:-}"
       # Timeouts
       RESPONSE_TIMEOUT: 120000
       SELECTOR_TIMEOUT: 10000
