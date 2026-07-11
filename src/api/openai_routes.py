@@ -57,7 +57,8 @@ from src.api.attachment_expander import (
     expand_attachments_for_chatgpt,
 )
 from src.api.browser_gate import browser_access_lock
-from src.chatgpt.client import ChatGPTClient
+from src.api.conversation_store import ConversationRoute, ConversationStore
+from src.chatgpt.client import ChatGPTClient, ModelSelectionError
 from src.claude.client import ClaudeClient
 from src.chatgpt.model_registry import (
     PUBLIC_BROWSER_MODEL_ID,
@@ -85,6 +86,9 @@ _thread_contracts: dict[str, tuple[float, str]] = {}
 _thread_user_contracts: dict[str, tuple[float, str, str]] = {}
 _thread_last_user_text: dict[str, tuple[float, str]] = {}
 _app_thread_lock = asyncio.Lock()
+_conversation_store: ConversationStore | None = None
+_conversation_store_path = ""
+_completion_route_outcomes: dict[str, ConversationRoute] = {}
 
 
 @dataclass(slots=True)
@@ -95,6 +99,18 @@ class _AppThreadMapping:
 
 
 _app_threads: dict[str, _AppThreadMapping] = {}
+
+
+@dataclass(slots=True)
+class _ConversationRouting:
+    project_key: str
+    app_key: str
+    conversation_key: str
+    previous_route: ConversationRoute | None
+    transcript_input: list[dict[str, Any]]
+    messages_for_browser: list[ChatMessage]
+    contract_hash: str
+    action: str
 
 MODEL_ID = PUBLIC_BROWSER_MODEL_ID
 _CACHE_TTL_SECONDS = 600
@@ -109,6 +125,7 @@ _APP_KEY_HEADERS = (
     "x-application-name",
     "x-requested-with",
 )
+_CONVERSATION_ID_HEADER = "x-catgpt-conversation-id"
 _THREAD_TITLE_TTL_SECONDS = 600
 _thread_title_lock = asyncio.Lock()
 _thread_titles: dict[str, tuple[float, str]] = {}
@@ -154,6 +171,83 @@ def _model_copy_compat(model: Any, **kwargs):
     for key, value in (kwargs.get("update") or {}).items():
         setattr(cloned, key, value)
     return cloned
+
+
+def _get_conversation_store() -> ConversationStore:
+    """Return the configured store, rebuilding it when tests/config change paths."""
+    global _conversation_store, _conversation_store_path
+    path = str(Config.API_CONVERSATION_DB)
+    if _conversation_store is None or _conversation_store_path != path:
+        _conversation_store = ConversationStore(path)
+        _conversation_store_path = path
+    return _conversation_store
+
+
+def _project_key() -> str:
+    return Config.chatgpt_project_url() or "global"
+
+
+def _canonical_message(message: ChatMessage | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(message, dict):
+        raw = dict(message)
+    else:
+        raw = _model_dump_compat(message, mode="json", exclude_none=True)
+    return {key: raw[key] for key in sorted(raw) if raw[key] is not None}
+
+
+def _message_hash(message: ChatMessage | dict[str, Any]) -> str:
+    canonical = json.dumps(
+        _canonical_message(message),
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _messages_from_transcript(transcript: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> list[ChatMessage]:
+    return [ChatMessage(**dict(item)) for item in transcript]
+
+
+def _request_contract_hash(request: ChatCompletionRequest) -> str:
+    """Hash instructions whose browser-thread persistence affects later turns."""
+    system = [
+        _canonical_message(message)
+        for message in request.messages
+        if message.role in {"system", "developer"}
+    ]
+    payload = {
+        "system": system,
+        "tools": _model_dump_compat(request, mode="json", exclude_none=True).get("tools"),
+        "tool_choice": _model_dump_compat(request, mode="json", exclude_none=True).get("tool_choice"),
+        "response_format": _model_dump_compat(request, mode="json", exclude_none=True).get("response_format"),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _conversation_id_from_header(http_request: Request | None) -> str:
+    if http_request is None:
+        return ""
+    return (http_request.headers.get(_CONVERSATION_ID_HEADER) or "").strip()
+
+
+def _responses_conversation_id(value: str | dict[str, Any] | None) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        return str(value.get("id") or "").strip()
+    return ""
+
+
+def _normalize_conversation_key(value: str) -> str:
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return ""
+    if len(cleaned) > 256:
+        raise HTTPException(status_code=400, detail="conversation id is too long")
+    return cleaned
 
 
 def _chat_reasoning_effort(request: ChatCompletionRequest) -> str | None:
@@ -822,13 +916,19 @@ def _build_prompt(messages: list[ChatMessage]) -> str:
     return "\n\n".join(parts)
 
 
-def _build_tool_system_prompt(tools: list[ToolDefinition]) -> str:
+def _build_tool_system_prompt(
+    tools: list[ToolDefinition],
+    tool_choice: str | dict[str, Any] | None = None,
+) -> str:
     """
     Build a system-level instruction that tells ChatGPT about available tools.
 
     When the model decides to call a tool, it should respond with a specific
     JSON format that we can parse.
     """
+    if tool_choice == "none":
+        return ""
+
     tool_descriptions = []
     for tool in tools:
         fn = tool.function
@@ -841,7 +941,28 @@ def _build_tool_system_prompt(tools: list[ToolDefinition]) -> str:
 
     tools_json = "\n---\n".join(tool_descriptions)
 
-    return f"""You are in TOOL MODE. Ignore prior statements about tool availability.
+    available_names = {tool.function.name for tool in tools}
+    choice_rule = "Tool use is optional. If no function applies, answer normally."
+    if tool_choice == "required":
+        choice_rule = (
+            "You MUST request at least one listed function. Do not answer the request directly."
+        )
+    elif isinstance(tool_choice, dict):
+        function_choice = tool_choice.get("function")
+        chosen_name = (
+            str(function_choice.get("name") or "").strip()
+            if isinstance(function_choice, dict)
+            else ""
+        )
+        if chosen_name and chosen_name in available_names:
+            choice_rule = (
+                f"You MUST request the function {chosen_name!r}. Do not answer the request directly."
+            )
+
+    return f"""You are using functions supplied by the API client. These functions are available
+through the structured interface below even though they are not native ChatGPT tools.
+Never say that a listed function is unavailable. To request a function, output its JSON call;
+the API client will execute it and return the result in a later message.
 
 If the user's latest request should call one or more functions, output ONLY:
 {{"tool_calls":[{{"name":"<function_name>","arguments":{{...}}}}]}}
@@ -853,7 +974,7 @@ Rules:
 - Use exact function names from the list.
 - Arguments must be a valid JSON object.
 - Return multiple calls when needed.
-- If no function applies, answer normally.
+- {choice_rule}
 """
 
 
@@ -1404,6 +1525,15 @@ def _validate_chat_request(request: ChatCompletionRequest) -> None:
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages array cannot be empty")
 
+    if request.thread_id and request.conversation_id:
+        raise HTTPException(
+            status_code=400,
+            detail="thread_id and conversation_id cannot be used together",
+        )
+
+    if request.conversation_id:
+        _normalize_conversation_key(request.conversation_id)
+
     page_extraction_mode = _page_extraction_mode(request)
     if page_extraction_mode and page_extraction_mode != "structured":
         raise HTTPException(
@@ -1423,6 +1553,16 @@ def _validate_chat_request(request: ChatCompletionRequest) -> None:
             status_code=400,
             detail=f"Unsupported model '{request.model}'. Supported models: {supported}",
         )
+
+
+def _apply_conversation_header(
+    request: ChatCompletionRequest,
+    http_request: Request,
+) -> ChatCompletionRequest:
+    header_id = _conversation_id_from_header(http_request)
+    if not header_id or request.conversation_id:
+        return request
+    return _model_copy_compat(request, update={"conversation_id": header_id})
 
 
 def _resolve_app_key(
@@ -1491,7 +1631,14 @@ async def _execute_image_generation(
                     current_tid = client._extract_thread_id()
                     if current_tid != mapped_thread:
                         log.info(f"OpenAI image app-thread mode: app='{app_key}' -> thread {mapped_thread}")
-                        await client.navigate_to_thread(mapped_thread)
+                        try:
+                            await client.navigate_to_thread(mapped_thread)
+                        except Exception as exc:
+                            log.warning("Image app-thread mapping was stale: %s", exc)
+                            async with _app_thread_lock:
+                                _app_threads.pop(app_key, None)
+                            await client.new_chat()
+                            app_thread_created_by_catgpt = True
                 else:
                     log.info(
                         "OpenAI image app-thread mode: app='%s' has no mapped thread. New chat will be created.",
@@ -1653,6 +1800,7 @@ async def create_chat_completion(
     via browser automation, and returns an OpenAI-formatted response.
     Supports tool/function calling via prompt injection.
     """
+    request = _apply_conversation_header(request, http_request)
     _validate_chat_request(request)
     app_key = _resolve_app_key(request, http_request)
     if request.stream:
@@ -1699,6 +1847,7 @@ async def create_chat_completion_scoped(
     http_request: Request,
 ) -> ChatCompletionResponse:
     """App-scoped alias for chat completions (maps app name from URL path)."""
+    request = _apply_conversation_header(request, http_request)
     _validate_chat_request(request)
     app_key = _resolve_app_key(request, http_request, endpoint_app_name=app_name)
     if request.stream:
@@ -1762,7 +1911,11 @@ def _responses_input_to_messages(
     return messages
 
 
-def _responses_request_to_chat_request(resp_req: ResponsesRequest) -> ChatCompletionRequest:
+def _responses_request_to_chat_request(
+    resp_req: ResponsesRequest,
+    *,
+    conversation_id: str = "",
+) -> ChatCompletionRequest:
     """Translate a ResponsesRequest into a ChatCompletionRequest for execution."""
     messages = _responses_input_to_messages(resp_req.input, resp_req.instructions)
 
@@ -1777,6 +1930,7 @@ def _responses_request_to_chat_request(resp_req: ResponsesRequest) -> ChatComple
         stream=resp_req.stream if resp_req.stream is not None else False,
         user=resp_req.user,
         reasoning_effort=(resp_req.reasoning.effort if resp_req.reasoning else None),
+        conversation_id=conversation_id or None,
         read_aloud=bool(resp_req.read_aloud),
     )
 
@@ -1784,6 +1938,7 @@ def _responses_request_to_chat_request(resp_req: ResponsesRequest) -> ChatComple
 def _responses_response_from_chat(
     chat_response: ChatCompletionResponse,
     model: str,
+    previous_response_id: str | None = None,
 ) -> ResponsesResponse:
     """Translate a ChatCompletionResponse into a Responses API response envelope.
 
@@ -1813,6 +1968,7 @@ def _responses_response_from_chat(
     return ResponsesResponse(
         id=f"resp_{chat_response.id.split('-', 1)[-1]}" if "-" in chat_response.id else chat_response.id,
         model=model,
+        previous_response_id=previous_response_id,
         output=output_items,
         usage=ResponsesUsageInfo(
             input_tokens=chat_response.usage.prompt_tokens,
@@ -1968,12 +2124,138 @@ def _validate_responses_request(request: ResponsesRequest) -> None:
     if not request.input:
         raise HTTPException(status_code=400, detail="input cannot be empty")
 
+    if request.conversation and request.previous_response_id:
+        raise HTTPException(
+            status_code=400,
+            detail="conversation and previous_response_id are mutually exclusive",
+        )
+
+    if request.conversation is not None and not _responses_conversation_id(request.conversation):
+        raise HTTPException(status_code=400, detail="conversation must contain a non-empty id")
+
     if not is_supported_chat_model(request.model):
         supported = ", ".join(list_public_chat_models())
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported model '{request.model}'. Supported models: {supported}",
         )
+
+
+async def _prepare_conversation_routing(
+    client: BrowserClient,
+    request: ChatCompletionRequest,
+    *,
+    app_key: str,
+    conversation_key: str,
+    seed_transcript: tuple[dict[str, Any], ...] | None = None,
+    preserve_omitted_contract: bool = True,
+) -> _ConversationRouting:
+    """Resolve one logical conversation to a verified browser thread."""
+    store = _get_conversation_store()
+    project_key = _project_key()
+    namespace = app_key or "default"
+    key = _normalize_conversation_key(conversation_key)
+    existing = store.get_route(project_key, namespace, key)
+    incoming = [_canonical_message(message) for message in request.messages]
+    incoming_hashes = [_message_hash(message) for message in incoming]
+    contract_hash = _request_contract_hash(request)
+    messages_for_browser = list(request.messages)
+    transcript_input = list(incoming)
+    action = "new-conversation"
+
+    if existing is None and seed_transcript:
+        transcript_input = [*map(dict, seed_transcript), *incoming]
+        messages_for_browser = _messages_from_transcript(transcript_input)
+        await client.new_chat()
+        action = "new-response-branch"
+    elif existing is None:
+        await client.new_chat()
+    else:
+        existing_hashes = list(existing.message_hashes)
+        prefix_match = (
+            len(incoming_hashes) >= len(existing_hashes)
+            and incoming_hashes[: len(existing_hashes)] == existing_hashes
+        )
+        non_instruction_incoming = [
+            message for message in request.messages if message.role not in {"system", "developer"}
+        ]
+        delta_shaped = (
+            0 < len(non_instruction_incoming) <= 1
+            and non_instruction_incoming[-1].role in {"user", "tool"}
+        )
+        has_contract_material = bool(
+            any(message.role in {"system", "developer"} for message in request.messages)
+            or request.tools
+            or request.response_format
+        )
+        if preserve_omitted_contract and delta_shaped and not has_contract_material:
+            contract_hash = existing.contract_hash
+
+        if existing.contract_hash and existing.contract_hash != contract_hash:
+            if len(incoming) > 2:
+                reconstructed = incoming
+            else:
+                reconstructed = [
+                    dict(message)
+                    for message in existing.transcript
+                    if message.get("role") not in {"system", "developer"}
+                ] + incoming
+            transcript_input = reconstructed
+            messages_for_browser = _messages_from_transcript(reconstructed)
+            await client.new_chat()
+            action = "new-chat-contract-change"
+            existing = None
+        elif prefix_match:
+            additions = incoming[len(existing_hashes):]
+            if not additions:
+                raise HTTPException(
+                    status_code=400,
+                    detail="conversation request does not contain a new message",
+                )
+            transcript_input = incoming
+            messages_for_browser = _messages_from_transcript(additions)
+            action = "verified-prefix-delta"
+        elif delta_shaped:
+            additions = [
+                _canonical_message(message)
+                for message in non_instruction_incoming
+            ]
+            transcript_input = [*map(dict, existing.transcript), *additions]
+            messages_for_browser = list(non_instruction_incoming)
+            action = "single-turn-delta"
+        else:
+            await client.new_chat()
+            action = "new-chat-history-diverged"
+            existing = None
+
+        if existing is not None:
+            current_thread = client._extract_thread_id()
+            if current_thread != existing.thread_id:
+                try:
+                    await client.navigate_to_thread(existing.thread_id)
+                except Exception as exc:
+                    log.warning(
+                        "Discarding stale conversation mapping %s -> %s: %s",
+                        key,
+                        existing.thread_id,
+                        exc,
+                    )
+                    store.delete_route(project_key, namespace, key)
+                    await client.new_chat()
+                    messages_for_browser = _messages_from_transcript(transcript_input)
+                    action = "new-chat-stale-mapping"
+                    existing = None
+
+    return _ConversationRouting(
+        project_key=project_key,
+        app_key=namespace,
+        conversation_key=key,
+        previous_route=existing,
+        transcript_input=transcript_input,
+        messages_for_browser=messages_for_browser,
+        contract_hash=contract_hash,
+        action=action,
+    )
 
 
 async def _execute_responses(
@@ -1985,14 +2267,76 @@ async def _execute_responses(
     Translates to ChatCompletionRequest, delegates to _execute_chat_completion,
     and translates back to Responses API format.
     """
-    chat_request = _responses_request_to_chat_request(request)
+    app_key = (app_key_override or "").strip()
+    conversation_id = _responses_conversation_id(request.conversation)
+    seed_transcript: tuple[dict[str, Any], ...] | None = None
+
+    if request.previous_response_id:
+        previous = _get_conversation_store().get_response(request.previous_response_id)
+        if previous is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown previous_response_id '{request.previous_response_id}'",
+            )
+        if previous.project_key != _project_key() or previous.app_key != (app_key or "default"):
+            raise HTTPException(
+                status_code=400,
+                detail="previous_response_id belongs to a different app or ChatGPT project",
+            )
+        current = _get_conversation_store().get_route(
+            previous.project_key,
+            previous.app_key,
+            previous.conversation_key,
+        )
+        if current and current.revision == previous.revision and current.message_hashes == previous.message_hashes:
+            conversation_id = previous.conversation_key
+        else:
+            conversation_id = f"response-branch:{request.previous_response_id}:{uuid.uuid4().hex[:12]}"
+            seed_transcript = previous.transcript
+
+    if not conversation_id:
+        # A Responses result must have an addressable local state object so its
+        # returned id can be used conventionally on the next call.
+        conversation_id = f"response-chain:{uuid.uuid4().hex}"
+
+    chat_request = _responses_request_to_chat_request(
+        request,
+        conversation_id=conversation_id,
+    )
     chat_request.stream = False
-    chat_response = await _execute_chat_completion(chat_request, app_key_override=app_key_override)
-    return _responses_response_from_chat(chat_response, request.model)
+    execute_kwargs: dict[str, Any] = {
+        "app_key_override": app_key_override,
+        "capture_route_outcome": True,
+    }
+    if seed_transcript is not None:
+        execute_kwargs["seed_transcript"] = seed_transcript
+    chat_response = await _execute_chat_completion(chat_request, **execute_kwargs)
+    response = _responses_response_from_chat(
+        chat_response,
+        request.model,
+        previous_response_id=request.previous_response_id,
+    )
+    route = _completion_route_outcomes.pop(chat_response.id, None)
+    if route is not None and request.store is not False:
+        _get_conversation_store().save_response(response.id, route)
+    elif (
+        route is not None
+        and request.store is False
+        and request.conversation is None
+        and not request.previous_response_id
+    ):
+        _get_conversation_store().delete_route(
+            route.project_key,
+            route.app_key,
+            route.conversation_key,
+        )
+    return response
 
 async def _execute_chat_completion(
     request: ChatCompletionRequest,
     app_key_override: str = "",
+    seed_transcript: tuple[dict[str, Any], ...] | None = None,
+    capture_route_outcome: bool = False,
 ) -> ChatCompletionResponse:
     """Shared sync/async executor for chat completions."""
     client = _get_client()
@@ -2008,6 +2352,8 @@ async def _execute_chat_completion(
             app_key = (app_key_override or "").strip()
             app_name = _display_app_name(app_key)
             explicit_thread_id = (request.thread_id or "").strip() if getattr(request, "thread_id", None) else ""
+            conversation_key = _normalize_conversation_key(request.conversation_id or "")
+            conversation_routing: _ConversationRouting | None = None
             routing_action = "reuse-current"
             app_thread_created_by_catgpt = False
             if Config.API_APP_THREAD_MODE and app_key:
@@ -2021,6 +2367,27 @@ async def _execute_chat_completion(
                     routing_action = "explicit-thread"
                 else:
                     routing_action = "explicit-thread"
+            elif conversation_key:
+                conversation_routing = await _prepare_conversation_routing(
+                    client,
+                    request,
+                    app_key=app_key,
+                    conversation_key=conversation_key,
+                    seed_transcript=seed_transcript,
+                    preserve_omitted_contract=not capture_route_outcome,
+                )
+                routing_action = conversation_routing.action
+                request = _model_copy_compat(
+                    request,
+                    deep=True,
+                    update={"messages": conversation_routing.messages_for_browser},
+                )
+                log.info(
+                    "Conversation route: app=%s conversation=%s action=%s",
+                    app_name,
+                    conversation_key,
+                    routing_action,
+                )
             elif Config.API_APP_THREAD_MODE and app_key:
                 now_app = time.time()
                 mapped_thread = ""
@@ -2038,8 +2405,16 @@ async def _execute_chat_completion(
                     current_tid = client._extract_thread_id()
                     if current_tid != mapped_thread:
                         log.info(f"OpenAI app-thread mode: app='{app_key}' -> thread {mapped_thread}")
-                        await client.navigate_to_thread(mapped_thread)
-                        routing_action = "mapped-thread"
+                        try:
+                            await client.navigate_to_thread(mapped_thread)
+                            routing_action = "mapped-thread"
+                        except Exception as exc:
+                            log.warning("App-thread mapping was stale: %s", exc)
+                            async with _app_thread_lock:
+                                _app_threads.pop(app_key, None)
+                            await client.new_chat()
+                            routing_action = "new-chat-stale-app-mapping"
+                            app_thread_created_by_catgpt = True
                     else:
                         routing_action = "mapped-thread"
                 else:
@@ -2108,16 +2483,26 @@ async def _execute_chat_completion(
 
             # -- Build the prompt --------------------------------
             messages = list(request.messages)
+            continuing_conversation = bool(
+                conversation_routing
+                and conversation_routing.previous_route is not None
+                and routing_action in {"verified-prefix-delta", "single-turn-delta"}
+            )
 
             # If tools are provided, inject tool definitions as a system prompt
-            if request.tools:
-                tool_system = _build_tool_system_prompt(request.tools)
-                # Prepend as the first system message
-                messages.insert(0, ChatMessage(role="system", content=tool_system))
+            if request.tools and request.tool_choice != "none" and not continuing_conversation:
+                tool_system = _build_tool_system_prompt(request.tools, request.tool_choice)
+                if tool_system:
+                    # Prepend as the first system message
+                    messages.insert(0, ChatMessage(role="system", content=tool_system))
 
             # If structured output is requested, force strict JSON response
             response_format_system = _build_response_format_system_prompt(effective_response_format)
-            if response_format_system and not _has_equivalent_response_instruction(messages, response_format_system):
+            if (
+                response_format_system
+                and not continuing_conversation
+                and not _has_equivalent_response_instruction(messages, response_format_system)
+            ):
                 messages.insert(0, ChatMessage(role="system", content=response_format_system))
 
             messages = _dedupe_system_messages(messages)
@@ -2216,13 +2601,19 @@ async def _execute_chat_completion(
                 full_prompt = f"{attachment_prefix}{full_prompt}" if full_prompt else attachment_prefix.strip()
 
             cache_key = _cache_key_for_request_with_app(request, app_key)
-            now = time.time()
-            async with _cache_lock:
-                _prune_cache(now)
-                cached_entry = _response_cache.get(cache_key)
-                if cached_entry and now - cached_entry[0] <= _CACHE_TTL_SECONDS:
-                    log.info("Response cache hit: returning cached completion")
-                    return _clone_cached_response(cached_entry[1])
+            stateful_request = bool(
+                conversation_routing
+                or explicit_thread_id
+                or (Config.API_APP_THREAD_MODE and app_key)
+            )
+            if not stateful_request:
+                now = time.time()
+                async with _cache_lock:
+                    _prune_cache(now)
+                    cached_entry = _response_cache.get(cache_key)
+                    if cached_entry and now - cached_entry[0] <= _CACHE_TTL_SECONDS:
+                        log.info("Response cache hit: returning cached completion")
+                        return _clone_cached_response(cached_entry[1])
 
             # -- Send to ChatGPT --------------------------------
             try:
@@ -2234,6 +2625,9 @@ async def _execute_chat_completion(
                     reasoning_effort=_chat_reasoning_effort(request),
                     read_aloud=bool(request.read_aloud),
                 )
+            except ModelSelectionError as e:
+                log.warning("Requested model selection failed closed: %s", e)
+                raise HTTPException(status_code=400, detail=str(e))
             except Exception as e:
                 log.error(f"ChatGPT error: {e}", exc_info=True)
                 raise HTTPException(status_code=500, detail=f"ChatGPT error: {str(e)}")
@@ -2248,7 +2642,7 @@ async def _execute_chat_completion(
                         if user_text:
                             _thread_last_user_text[thread_for_contract] = (time.time(), user_text)
 
-            if Config.API_APP_THREAD_MODE and app_key:
+            if Config.API_APP_THREAD_MODE and app_key and conversation_routing is None:
                 thread_for_app = result.thread_id or client._extract_thread_id()
                 if thread_for_app:
                     post_prune_expired: list[str] = []
@@ -2370,7 +2764,7 @@ async def _execute_chat_completion(
                     except Exception as e:
                         log.warning(f"Structured cardinality retry failed: {e}")
 
-            if request.tools:
+            if request.tools and request.tool_choice != "none":
                 tool_calls = _parse_tool_calls(response_text, request.tools)
                 if tool_calls:
                     finish_reason = "tool_calls"
@@ -2415,9 +2809,38 @@ async def _execute_chat_completion(
                 f"tokens~{response.usage.total_tokens}"
             )
 
-            async with _cache_lock:
-                _prune_cache(time.time())
-                _response_cache[cache_key] = (time.time(), _model_copy_compat(response, deep=True))
+            if conversation_routing is not None:
+                thread_id = result.thread_id or client._extract_thread_id()
+                if not thread_id:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="ChatGPT did not expose a thread id for the logical conversation",
+                    )
+                assistant_message = _canonical_message(
+                    ChatMessage(
+                        role="assistant",
+                        content=response_text,
+                        tool_calls=tool_calls,
+                    )
+                )
+                transcript = [*conversation_routing.transcript_input, assistant_message]
+                hashes = [_message_hash(message) for message in transcript]
+                route = _get_conversation_store().save_route(
+                    project_key=conversation_routing.project_key,
+                    app_key=conversation_routing.app_key,
+                    conversation_key=conversation_routing.conversation_key,
+                    thread_id=thread_id,
+                    transcript=transcript,
+                    message_hashes=hashes,
+                    contract_hash=conversation_routing.contract_hash,
+                )
+                if capture_route_outcome:
+                    _completion_route_outcomes[response.id] = route
+
+            if not stateful_request:
+                async with _cache_lock:
+                    _prune_cache(time.time())
+                    _response_cache[cache_key] = (time.time(), _model_copy_compat(response, deep=True))
 
             return response
     finally:
@@ -2455,6 +2878,7 @@ async def _submit_async_chat_job(
     endpoint_app_name: str = "",
 ) -> ChatCompletionJobResponse:
     """Shared async chat submit logic for generic and app-scoped routes."""
+    request = _apply_conversation_header(request, http_request)
     _validate_chat_request(request)
     _get_client()
 

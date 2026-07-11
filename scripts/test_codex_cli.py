@@ -20,12 +20,12 @@ Codex CLI sends:
   - tool_choice="auto" (default)
 
 Prerequisites:
-  - CatGPT API server running: python -m src.api.server
+  - CatGPT API server running: uv run python -m src.api.server
   - API_TOKEN must match .env (default: dummy123)
 
 Usage:
-  python scripts/test_codex_cli.py
-  python scripts/test_codex_cli.py --test 1
+  uv run python scripts/test_codex_cli.py
+  uv run python scripts/test_codex_cli.py --test 1
 """
 
 from __future__ import annotations

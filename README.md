@@ -9,10 +9,11 @@ browser profile.
 
 1. [What is CatGPT](#what-is-catgpt)
 2. [How to Setup on Docker](#how-to-setup-on-docker)
-3. [Supported Models](#supported-models)
-4. [Docker Environment Variables](#docker-environment-variables)
-5. [Usage Examples](#usage-examples)
-6. [Troubleshooting](#troubleshooting)
+3. [Local Development with uv](#local-development-with-uv)
+4. [Supported Models](#supported-models)
+5. [Docker Environment Variables](#docker-environment-variables)
+6. [Usage Examples](#usage-examples)
+7. [Troubleshooting](#troubleshooting)
 
 ## What is CatGPT
 
@@ -33,11 +34,12 @@ This version supports:
 | File attachments | Yes |
 | App-scoped routes such as `/mealie/v1/chat/completions` | Yes |
 | App-thread isolation using request identity | Yes |
+| Durable conversation routing and Responses continuations | Yes |
 | Model switching for current ChatGPT picker models | Yes |
 | noVNC browser login UI | Yes |
 
 The default browser-backed model id is `catgpt-browser`. You can also request
-specific ChatGPT picker models listed below.
+specific ChatGPT picker models returned by `GET /v1/models`.
 
 ## How to Setup on Docker
 
@@ -47,6 +49,10 @@ published image:
 ```yaml
 image: ghcr.io/thebadfella/catgpt:latest
 ```
+
+Set `CATGPT_IMAGE` to use an image published by your own fork. The Compose file
+also includes a local build definition, so `docker compose up --build -d`
+builds the checked-out source instead of merely restarting the published image.
 
 1. Clone the repo.
 
@@ -121,6 +127,29 @@ After code changes, rebuild instead of only restarting:
 docker compose up --build -d
 ```
 
+## Local Development with uv
+
+The repository uses `pyproject.toml` and the committed `uv.lock` as its single
+Python dependency source. Install the locked development environment and the
+Patchright browser once:
+
+```bash
+uv sync --group dev
+uv run patchright install chromium
+cp .env.example .env
+```
+
+Then run CatGPT and its deterministic test suite through the same environment:
+
+```bash
+uv run python -m src.api.server
+uv run python -m unittest discover -s tests
+```
+
+See [docs/SETUP.md](docs/SETUP.md) for login and provider details and
+[docs/TESTING.md](docs/TESTING.md) for automated and live browser checks. The
+login-free CI suite runs on Python 3.11 and 3.14 for pushes and pull requests.
+
 ## Supported Models
 
 CatGPT exposes `catgpt-browser` plus the concrete models discovered from the
@@ -141,6 +170,11 @@ per model. Use Chat Completions `reasoning_effort`, Responses
 `gpt-5.6-sol-high` from `/v1/models`. A model-id suffix takes precedence over
 an explicit reasoning field, and unsupported efforts clamp to the closest
 visible row.
+
+The first `GET /v1/models` call after startup can take roughly 20–30 seconds:
+CatGPT temporarily visits each visible model to discover its reasoning rows,
+then restores the picker state it found before discovery. Later calls use a
+short-lived catalog and are normally fast.
 
 ## Docker Environment Variables
 
@@ -174,9 +208,9 @@ visible row.
 | --- | --- | --- |
 | `CHATGPT_DEFAULT_MODEL` | empty | Model to use when a request asks for `catgpt-browser`, `auto`, or `default`. |
 | `CHATGPT_MODEL_ALIASES` | empty | Optional comma-separated `model=label|alias` override map for legacy or unusual picker labels. |
-| `CHATGPT_PROJECT_URL` | empty | Optional ChatGPT project URL. New chats are created only in that project. |
+| `CHATGPT_PROJECT_URL` | empty | Optional ChatGPT project URL. New chats are created only in that project. Example: `https://chatgpt.com/g/g-p-00000000000000000000000000000000-example/project` (fake). |
 | `CHATGPT_MODEL_SWITCH_TIMEOUT` | `10000` | Milliseconds to wait for a model label after switching. |
-| `CHATGPT_MODEL_SWITCH_STRICT` | `false` | Return an error when a configured model is not visible instead of continuing. |
+| `CHATGPT_MODEL_DISCOVERY_TTL_SECONDS` | `600` | Seconds before the live model catalog is rediscovered. |
 
 ### API
 
@@ -192,6 +226,7 @@ visible row.
 | `API_APP_THREAD_MODE` | `false`, `true` in compose | Route different apps/users to dedicated ChatGPT threads. |
 | `API_APP_THREAD_TTL_SECONDS` | `86400` | App-thread mapping TTL. |
 | `API_APP_THREAD_DELETE_EXPIRED` | `false`, `true` in compose | Delete expired CatGPT-owned app threads from ChatGPT UI. |
+| `API_CONVERSATION_DB` | `state/conversations.sqlite3` | SQLite ledger for logical conversations, transcripts, browser threads, and Responses IDs. |
 | `API_HEADER_ROW_MERGE_MODE` | `false`, `true` in compose | Merge header-only rows into the next row for structured JSON outputs. |
 
 ### Timeouts and interaction pacing
@@ -266,6 +301,42 @@ response = client.responses.create(
 print(response.output[0].content[0].text)
 ```
 
+Continue that Responses chain using the conventional response id:
+
+```python
+follow_up = client.responses.create(
+    model="catgpt-browser",
+    previous_response_id=response.id,
+    input="Now reduce that to the single most important check.",
+)
+```
+
+You may instead pass a stable `conversation="conv_my_app_chat_123"`. As in the
+OpenAI Responses API, `conversation` and `previous_response_id` cannot be used
+together.
+
+### Durable Chat Completions conversations
+
+Chat Completions normally expects the client to send canonical history. CatGPT
+adds an optional `conversation_id` field (or `X-CatGPT-Conversation-ID` header)
+to map that logical history to a persistent browser thread:
+
+```json
+{
+  "model": "catgpt-browser",
+  "conversation_id": "sillytavern:character-42:chat-7",
+  "messages": [
+    {"role": "user", "content": "Continue this story."}
+  ]
+}
+```
+
+When a client sends full history, CatGPT verifies that its stored message hashes
+are an exact prefix and forwards only the new suffix. A rewind or changed prefix
+starts a fresh browser thread, preventing two unrelated stories from being
+mixed. A single new user message with a conversation id is treated as a delta.
+The ledger is partitioned by ChatGPT project, app route, and conversation id.
+
 ### Async job
 
 ```bash
@@ -308,9 +379,12 @@ http://localhost:8650/linkwarden/v1/chat/completions
 http://localhost:8650/immich/v1/chat/completions
 ```
 
-With `API_APP_THREAD_MODE=true`, CatGPT keeps those apps in separate sticky
-threads. If `CHATGPT_PROJECT_URL` is configured, the new threads are created in
-that project and mapped threads are reopened through project-scoped URLs.
+With `API_APP_THREAD_MODE=true`, CatGPT can keep legacy single-message traffic
+from those apps in separate sticky threads. The app path is an application
+namespace, not a conversation identity: use `conversation_id`, `conversation`,
+or `previous_response_id` when an app has multiple chats. If
+`CHATGPT_PROJECT_URL` is configured, new threads are created in that project and
+mapped threads are reopened only through project-scoped URLs.
 
 ### Useful things to run through CatGPT
 
@@ -330,10 +404,10 @@ that project and mapped threads are reopened through project-scoped URLs.
 | API says the browser is not initialized | Wait 30-60 seconds after container start, then check `docker logs catgpt --tail 100`. |
 | Login expired | Open `http://localhost:6080` and log in again. |
 | noVNC opens but ChatGPT is logged out | Log in inside noVNC; the profile persists in the mounted browser volume. |
-| Model switch fails | Check `/v1/models`, then update `CHATGPT_MODEL_ALIASES` or set `CHATGPT_MODEL_SWITCH_STRICT=false`. |
+| Model switch fails | Check `/v1/models`; explicit model requests fail closed if CatGPT cannot confirm the selected picker row. |
 | A code change is not visible | Run `docker compose up --build -d`. |
 | Browser profile is stuck | Stop the container and remove stale browser lock files from the mounted browser directory. |
 | Responses are slow | ChatGPT browser automation is serialized; one request uses the browser at a time. |
 
-CatGPT intentionally does not support streaming. Requests return after the
-browser response is complete.
+CatGPT cannot stream live browser tokens. For compatible clients, `stream=true`
+returns an SSE stream after the complete browser response is available.

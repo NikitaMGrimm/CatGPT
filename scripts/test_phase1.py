@@ -12,9 +12,9 @@ Steps:
 7. Log everything and print results
 
 Usage:
-    python scripts/test_phase1.py
-    python scripts/test_phase1.py --message "What is 2+2?"
-    python scripts/test_phase1.py --new-chat
+    uv run python scripts/test_phase1.py
+    uv run python scripts/test_phase1.py --message "What is 2+2?"
+    uv run python scripts/test_phase1.py --new-chat
 """
 
 import argparse
@@ -67,7 +67,7 @@ async def main(message: str, new_chat: bool, observe: bool):
         print("  [3/7] Checking login status...")
         logged_in = await browser.is_logged_in()
         if not logged_in:
-            print("\n  ❌ Not logged in! Run 'python scripts/first_login.py' first.")
+            print("\n  ❌ Not logged in! Run 'uv run python scripts/first_login.py' first.")
             log.error("Not logged in — aborting test")
             return
 

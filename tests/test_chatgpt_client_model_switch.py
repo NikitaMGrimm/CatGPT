@@ -205,6 +205,40 @@ class ChatGPTClientModelSwitchTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "concrete-model submenu"):
                 await client.ensure_model("gpt-9.9")
 
+    async def test_explicit_model_failure_is_closed_even_without_strict_mode(self) -> None:
+        await _set_picker_dom(self.page)
+        client = ChatGPTClient(self.page)
+        with patch.object(Config, "CHATGPT_MODEL_SWITCH_STRICT", False), patch(
+            "src.chatgpt.client.asyncio.sleep", _noop_sleep
+        ):
+            with self.assertRaisesRegex(RuntimeError, "concrete-model submenu"):
+                await client.ensure_model("gpt-9.9")
+
+    async def test_checked_row_accepts_one_authoritative_signal(self) -> None:
+        await _set_picker_dom(self.page)
+        client = ChatGPTClient(self.page)
+        with patch("src.chatgpt.client.asyncio.sleep", _noop_sleep):
+            self.assertTrue(await client._open_model_picker())
+            await self.page.evaluate(
+                """
+                () => document.querySelectorAll('[role=menuitemradio][aria-checked=true]')
+                    .forEach((row) => row.removeAttribute('data-state'))
+                """
+            )
+            state = await client._nested_model_picker_state()
+        self.assertTrue(any(row["checked"] for row in state["reasoning"]))
+
+    async def test_discovery_restores_initial_picker_state(self) -> None:
+        await _set_picker_dom(self.page, "GPT-5.4")
+        client = ChatGPTClient(self.page)
+        with patch("src.chatgpt.client.asyncio.sleep", _noop_sleep), patch.object(
+            Config, "CHATGPT_MODEL_DISCOVERY_TTL_SECONDS", 600
+        ):
+            labels = await client.discover_available_models(force=True)
+        self.assertIn("GPT-5.6 Sol", labels)
+        self.assertEqual(await self.page.evaluate("window.selectedModel"), "GPT-5.4")
+        self.assertEqual(await self.page.evaluate("window.selectedEffort['GPT-5.4']"), "High")
+
 
 if __name__ == "__main__":
     unittest.main()

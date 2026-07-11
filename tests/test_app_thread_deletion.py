@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import importlib.util
+from pathlib import Path
 import sys
 import time
 import unittest
@@ -84,21 +86,28 @@ def _fresh_openai_routes():
         _restore_fastapi()
 
 
+def _isolated_config():
+    """Load src/config.py without replacing the process-wide src.config module."""
+    config_path = Path(__file__).resolve().parents[1] / "src" / "config.py"
+    spec = importlib.util.spec_from_file_location("catgpt_test_config", config_path)
+    if spec is None or spec.loader is None:  # pragma: no cover - import invariant
+        raise RuntimeError(f"Could not load config module from {config_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.Config
+
+
 class TestAppThreadDeletionConfig(unittest.TestCase):
     """Config default and flag behavior tests."""
 
     def test_default_is_false(self):
         with unittest.mock.patch.dict("os.environ", {}, clear=True):
-            import src.config
-            importlib.reload(src.config)
-            from src.config import Config as FreshConfig
+            FreshConfig = _isolated_config()
             self.assertFalse(FreshConfig.API_APP_THREAD_DELETE_EXPIRED)
 
     def test_explicit_true(self):
         with unittest.mock.patch.dict("os.environ", {"API_APP_THREAD_DELETE_EXPIRED": "true"}, clear=True):
-            import src.config
-            importlib.reload(src.config)
-            from src.config import Config as FreshConfig
+            FreshConfig = _isolated_config()
             self.assertTrue(FreshConfig.API_APP_THREAD_DELETE_EXPIRED)
 
 

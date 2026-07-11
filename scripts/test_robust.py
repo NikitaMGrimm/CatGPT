@@ -10,7 +10,7 @@ Validates:
   5. Multiple follow-ups with complex content
 
 Usage:
-    python scripts/test_robust.py
+    uv run python scripts/test_robust.py
 """
 
 from __future__ import annotations
@@ -127,7 +127,7 @@ async def main():
         await asyncio.sleep(3)
 
         if not await browser.is_logged_in():
-            print("\n  ❌ Not logged in! Run 'python scripts/first_login.py' first.")
+            print("\n  ❌ Not logged in! Run 'uv run python scripts/first_login.py' first.")
             return
 
         print("  ✅ Logged in\n")

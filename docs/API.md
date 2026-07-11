@@ -15,6 +15,7 @@ CatGPT Gateway exposes an OpenAI-compatible API. Any client that works with the 
   - [File Attachments](#file-attachments)
   - [Image Generation (ChatGPT only)](#image-generation-chatgpt-only)
   - [List Models](#list-models)
+  - [Responses API](#responses-api)
 - [Custom REST API](#custom-rest-api)
 - [TUI Terminal Client](#tui-terminal-client)
 - [Provider Differences](#provider-differences)
@@ -82,15 +83,21 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `model` | string | yes | `claude-browser` or `catgpt-browser` |
+| `model` | string | yes | A base provider id or concrete id returned by `GET /v1/models` |
 | `reasoning_effort` | string | no | Official Chat Completions reasoning effort; CatGPT maps aliases and clamps to the model's visible rows |
 | `messages` | array | yes | Array of message objects |
 | `tools` | array | no | Tool/function definitions |
 | `tool_choice` | string/object | no | `auto`, `none`, `required`, or specific function |
 | `temperature` | float | no | Ignored (browser controls this) |
 | `max_tokens` | int | no | Ignored |
-| `stream` | bool | no | Must be `false` (streaming not supported) |
+| `stream` | bool | no | Accepted. CatGPT buffers the browser response, then emits it as compatibility SSE; browser tokens are not streamed live. |
+| `conversation_id` | string | no | CatGPT extension: stable logical-conversation id for durable sticky routing. May instead be sent in `X-CatGPT-Conversation-ID`. |
+| `thread_id` | string | no | CatGPT extension: target one known ChatGPT thread directly. Mutually exclusive with `conversation_id`. |
 | `read_aloud` | bool | no | ChatGPT only. Opens `More actions` -> `Read aloud`, downloads the browser-generated audio, and returns it at `choices[0].message.audio`. |
+
+For durable routing, prefer `conversation_id` over `thread_id`. CatGPT stores the
+logical id, verifies full-history prefixes when supplied, and forwards only the
+new suffix. A changed or rewound history branches to a fresh ChatGPT thread.
 
 **Response:**
 
@@ -161,7 +168,7 @@ Claude accepts the flag for compatibility but currently returns no audio.
 Manual test:
 
 ```bash
-python scripts/test_read_aloud.py
+uv run python scripts/test_read_aloud.py
 ```
 
 ---
@@ -460,7 +467,7 @@ curl -X POST http://localhost:8000/v1/responses \
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `model` | string | yes | `claude-browser` or `catgpt-browser` |
+| `model` | string | yes | A base provider id or concrete id returned by `GET /v1/models` |
 | `reasoning` | object | no | Responses-style object such as `{"effort": "high"}` |
 | `input` | string or array | yes | User input as a string or array of input items with `role` and `content` |
 | `instructions` | string | no | System instructions (converted to a system message) |
@@ -468,8 +475,15 @@ curl -X POST http://localhost:8000/v1/responses \
 | `tool_choice` | string/object | no | `auto`, `none`, `required`, or specific function |
 | `temperature` | float | no | Ignored |
 | `max_output_tokens` | int | no | Ignored |
-| `stream` | bool | no | Must be `false` (streaming not supported) |
+| `stream` | bool | no | Accepted. CatGPT buffers the browser response, then emits compatibility SSE; browser tokens are not streamed live. |
+| `conversation` | string/object | no | Stable Responses conversation id. Reuses the associated browser thread. |
+| `previous_response_id` | string | no | Continue from a prior stored CatGPT Responses result, or branch from its stored snapshot if the original chain has moved on. |
+| `store` | bool | no | Defaults to `true`. When `false`, the returned response id is not saved for later `previous_response_id` use. |
 | `read_aloud` | bool | no | ChatGPT only (same as chat completions) |
+
+`conversation` and `previous_response_id` are mutually exclusive. Responses
+without either field still receive an addressable response id; pass that id as
+`previous_response_id` to continue the chain conventionally.
 
 **Response:**
 
@@ -503,7 +517,10 @@ curl -X POST http://localhost:8000/v1/responses \
 
 **App-scoped (with app name in URL):**
 
-Both `/v1/responses` and `/{app_name}/v1/responses` are supported.
+Both `/v1/responses` and `/{app_name}/v1/responses` are supported. The app path
+is a namespace, not a conversation id. Use `conversation`,
+`previous_response_id`, or (for Chat Completions) `conversation_id` when one app
+contains multiple independent chats.
 
 ---
 
@@ -549,7 +566,7 @@ curl -H "Authorization: Bearer dummy123" http://localhost:8000/status
 CatGPT includes a terminal chat interface with a cyberpunk theme, built with Textual.
 
 ```bash
-python -m src.cli.app
+uv run python -m src.cli.app
 ```
 
 ### Commands

@@ -15,13 +15,13 @@ Validates the full Responses API contract including:
   10. Response schema field-level validation
 
 Prerequisites:
-  - CatGPT API server running: python -m src.api.server
+  - CatGPT API server running: uv run python -m src.api.server
   - API_TOKEN must match .env (default: dummy123)
 
 Usage:
-  python scripts/test_responses_api.py
-  python scripts/test_responses_api.py --base-url http://host:port
-  python scripts/test_responses_api.py --test 1    # run a specific test
+  uv run python scripts/test_responses_api.py
+  uv run python scripts/test_responses_api.py --base-url http://host:port
+  uv run python scripts/test_responses_api.py --test 1    # run a specific test
 """
 
 from __future__ import annotations
@@ -663,7 +663,7 @@ def main():
             print(f"  Health   : OK")
     except httpx.ConnectError:
         print(f"\n  ❌ Cannot connect to {base_url}")
-        print("     Start the server first: python -m src.api.server")
+        print("     Start the server first: uv run python -m src.api.server")
         sys.exit(1)
 
     start_time = time.time()

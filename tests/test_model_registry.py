@@ -46,10 +46,28 @@ class ModelRegistryTests(unittest.TestCase):
         self.assertNotIn("o3-high", models)
 
     def test_reasoning_aliases_and_substring_labels(self) -> None:
-        self.assertEqual(model_registry.canonical_reasoning_effort("Instant 5.5"), "low")
+        self.assertIsNone(model_registry.canonical_reasoning_effort("Instant 5.5"))
+        self.assertEqual(
+            model_registry.canonical_reasoning_effort("Instant 5.5", substring=True),
+            "low",
+        )
         self.assertEqual(model_registry.canonical_reasoning_effort("light"), "low")
         self.assertEqual(model_registry.canonical_reasoning_effort("deep"), "high")
         self.assertEqual(model_registry.canonical_reasoning_effort("extra-high"), "xhigh")
+        self.assertEqual(model_registry.canonical_reasoning_effort("maximum"), "max")
+        self.assertIsNone(model_registry.canonical_reasoning_effort("office"))
+        self.assertIsNone(model_registry.canonical_reasoning_effort("admin"))
+
+    def test_unknown_and_ultra_reasoning_rows_are_exposed(self) -> None:
+        model_registry.register_discovered_models(["GPT-5.6 Sol"])
+        model_registry.register_discovered_reasoning("GPT-5.6 Sol", ["Medium", "Ultra", "Quantum"])
+        models = model_registry.list_public_chat_models()
+        self.assertIn("gpt-5.6-sol-ultra", models)
+        self.assertIn("gpt-5.6-sol-quantum", models)
+        self.assertEqual(
+            model_registry.choose_reasoning_label("ultra", ["Medium", "Ultra"]),
+            ("Ultra", "ultra"),
+        )
 
     def test_reasoning_clamps_to_visible_range(self) -> None:
         self.assertEqual(

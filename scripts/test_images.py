@@ -9,7 +9,7 @@ Tests:
   4. Verify text-only response has no false image detection
 
 Usage:
-    python scripts/test_images.py
+    uv run python scripts/test_images.py
 """
 
 from __future__ import annotations

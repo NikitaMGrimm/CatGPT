@@ -56,6 +56,7 @@ class Config:
     )
     CHATGPT_MODEL_SWITCH_TIMEOUT: int = int(os.getenv("CHATGPT_MODEL_SWITCH_TIMEOUT", "10000"))
     CHATGPT_MODEL_SWITCH_STRICT: bool = os.getenv("CHATGPT_MODEL_SWITCH_STRICT", "false").lower() == "true"
+    CHATGPT_MODEL_DISCOVERY_TTL_SECONDS: int = int(os.getenv("CHATGPT_MODEL_DISCOVERY_TTL_SECONDS", "600"))
     ATTACHMENT_EXPAND_MULTIPAGE: bool = os.getenv("ATTACHMENT_EXPAND_MULTIPAGE", "true").lower() == "true"
     ATTACHMENT_MAX_PAGES: int = int(os.getenv("ATTACHMENT_MAX_PAGES", "24"))
     ATTACHMENT_RENDER_DPI: int = int(os.getenv("ATTACHMENT_RENDER_DPI", "144"))
@@ -117,6 +118,9 @@ class Config:
     API_APP_THREAD_TTL_SECONDS: int = int(os.getenv("API_APP_THREAD_TTL_SECONDS", "86400"))
     # If true, delete expired app-thread ChatGPT conversations from the browser UI
     API_APP_THREAD_DELETE_EXPIRED: bool = os.getenv("API_APP_THREAD_DELETE_EXPIRED", "false").lower() == "true"
+    API_CONVERSATION_DB: Path = _PROJECT_ROOT / os.getenv(
+        "API_CONVERSATION_DB", "state/conversations.sqlite3"
+    )
     # If true, merge header-only rows (null fields + note/context text) into next item note/context
     API_HEADER_ROW_MERGE_MODE: bool = os.getenv("API_HEADER_ROW_MERGE_MODE", "false").lower() == "true"
     RATE_LIMIT_SECONDS: int = int(os.getenv("RATE_LIMIT_SECONDS", "5"))

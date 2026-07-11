@@ -6,7 +6,7 @@ Run this once to create a persistent browser session. After signing in,
 the session (cookies, tokens) is saved to browser_data/ and reused.
 
 Usage:
-    python scripts/first_login.py
+    uv run python scripts/first_login.py
 """
 
 import asyncio

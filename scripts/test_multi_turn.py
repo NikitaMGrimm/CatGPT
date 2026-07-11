@@ -10,7 +10,7 @@ Each message response is verified and logged. The test only confirms
 completion after the response has fully streamed.
 
 Usage:
-    python scripts/test_multi_turn.py
+    uv run python scripts/test_multi_turn.py
 """
 
 from __future__ import annotations
@@ -138,7 +138,7 @@ async def main():
 
         # Verify login
         if not await browser.is_logged_in():
-            print("\n  ❌ Not logged in! Run 'python scripts/first_login.py' first.")
+            print("\n  ❌ Not logged in! Run 'uv run python scripts/first_login.py' first.")
             return
 
         print("  ✅ Logged in\n")

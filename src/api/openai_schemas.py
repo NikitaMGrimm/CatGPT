@@ -100,6 +100,9 @@ class ChatCompletionRequest(BaseModel):
     # convenience for clients that share payload builders with Responses.
     reasoning_effort: Optional[str] = None
     reasoning: Optional[ReasoningOptions] = None
+    # CatGPT extension for durable logical-conversation routing. Clients may
+    # alternatively send X-CatGPT-Conversation-ID.
+    conversation_id: Optional[str] = None
     # CatGPT extension: explicit thread targeting for app-level isolation.
     thread_id: Optional[str] = None
     response_format: Optional[Any] = None
@@ -241,6 +244,10 @@ class ResponsesRequest(BaseModel):
     metadata: Optional[dict[str, Any]] = None
     user: Optional[str] = None
     reasoning: Optional[ReasoningOptions] = None
+    # OpenAI Responses conversation-state fields. They are mutually exclusive.
+    conversation: Optional[Union[str, dict[str, Any]]] = None
+    previous_response_id: Optional[str] = None
+    store: Optional[bool] = True
     # CatGPT extension
     read_aloud: Optional[bool] = False
 
@@ -281,5 +288,6 @@ class ResponsesResponse(BaseModel):
     object: str = "response"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str = "catgpt-browser"
+    previous_response_id: Optional[str] = None
     output: list[Union[ResponseOutputMessage, ResponseOutputToolCall]] = Field(default_factory=list)
     usage: ResponsesUsageInfo = Field(default_factory=ResponsesUsageInfo)

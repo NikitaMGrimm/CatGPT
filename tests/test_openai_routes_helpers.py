@@ -49,6 +49,7 @@ if "playwright_stealth" not in sys.modules:
 from src.api.openai_routes import (
     _build_page_extraction_note,
     _build_page_extraction_response_format,
+    _build_tool_system_prompt,
     _chat_completion_sse_chunk,
     _detect_user_prefix_contract,
     _display_app_name,
@@ -83,6 +84,8 @@ from src.api.openai_schemas import (
     ResponsesUsageInfo,
     ToolCall,
     FunctionCallInfo,
+    FunctionDefinition,
+    ToolDefinition,
 )
 
 
@@ -115,6 +118,21 @@ async def _collect_stream(stream_response) -> list[bytes]:
 
 
 class OpenAIRoutesHelpersTests(unittest.TestCase):
+    def test_tool_prompt_honors_none_choice(self) -> None:
+        tools = [ToolDefinition(function=FunctionDefinition(name="add_numbers"))]
+        self.assertEqual(_build_tool_system_prompt(tools, "none"), "")
+
+    def test_tool_prompt_honors_required_and_specific_choices(self) -> None:
+        tools = [ToolDefinition(function=FunctionDefinition(name="add_numbers"))]
+        required = _build_tool_system_prompt(tools, "required")
+        specific = _build_tool_system_prompt(
+            tools,
+            {"type": "function", "function": {"name": "add_numbers"}},
+        )
+        self.assertIn("MUST request at least one", required)
+        self.assertIn("MUST request the function 'add_numbers'", specific)
+        self.assertIn("Never say that a listed function is unavailable", specific)
+
     def test_route_families_share_browser_access_lock(self) -> None:
         self.assertIs(native_routes.browser_access_lock, browser_access_lock)
         self.assertIs(openai_routes_module.browser_access_lock, browser_access_lock)
@@ -491,6 +509,7 @@ class ResponsesAPITests(unittest.TestCase):
         async def fake_execute_chat_completion(
             request: ChatCompletionRequest,
             app_key_override: str = "",
+            **_kwargs,
         ) -> ChatCompletionResponse:
             captured["app_key_override"] = app_key_override
             return ChatCompletionResponse(
@@ -522,6 +541,7 @@ class ResponsesAPITests(unittest.TestCase):
         async def fake_execute_chat_completion(
             request: ChatCompletionRequest,
             app_key_override: str = "",
+            **_kwargs,
         ) -> ChatCompletionResponse:
             captured["stream"] = bool(request.stream)
             return ChatCompletionResponse(
@@ -560,6 +580,7 @@ class ResponsesAPITests(unittest.TestCase):
         async def fake_execute_chat_completion(
             request: ChatCompletionRequest,
             app_key_override: str = "",
+            **_kwargs,
         ) -> ChatCompletionResponse:
             captured["stream"] = bool(request.stream)
             return ChatCompletionResponse(

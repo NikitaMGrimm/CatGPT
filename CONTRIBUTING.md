@@ -9,15 +9,13 @@ Thanks for your interest in contributing! This project is open source and we wel
 1. **Fork** the repo on GitHub
 2. **Clone** your fork:
    ```bash
-   git clone https://github.com/YOUR_USERNAME/CatGPT-Gateway.git
-   cd CatGPT-Gateway
+   git clone https://github.com/YOUR_USERNAME/CatGPT.git
+   cd CatGPT
    ```
 3. **Set up** the development environment:
    ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   patchright install chromium
+   uv sync --group dev
+   uv run patchright install chromium
    cp .env.example .env
    ```
 4. **Create a branch** for your changes:
@@ -33,26 +31,33 @@ Thanks for your interest in contributing! This project is open source and we wel
 
 ```bash
 # Start the API server
-python -m src.api.server
+uv run python -m src.api.server
 
 # Run tests
-python scripts/test_phase1.py
-python scripts/test_langchain_tools.py
+uv run python -m unittest discover -s tests
+uv run python scripts/test_langchain_tools.py
 ```
 
 ### Testing
 
-Before submitting a PR, run the relevant test scripts to make sure nothing is broken:
+Before submitting a PR, run the deterministic checks used by GitHub Actions:
 
 ```bash
-python scripts/test_phase1.py           # Basic pipeline
-python scripts/test_multi_turn.py       # Multi-turn conversations
-python scripts/test_robust.py           # Edge cases
-python scripts/test_images.py           # Image detection
-python scripts/test_langchain_tools.py  # LangChain + tool calling (needs server running)
+uv lock --check
+uv sync --frozen --group dev
+uv run python -m compileall -q src tests scripts
+uv run python -m unittest discover -s tests
+git diff --check
 ```
 
-All test scripts auto-detect the provider from your `.env` file.
+The CI workflow runs the deterministic suite on the oldest and newest supported
+Python versions. It deliberately does not install a browser or require a
+ChatGPT login.
+
+Run the relevant `scripts/test_*.py` integration check when changing browser
+selectors, login, navigation, model switching, response detection, or API
+translation. These scripts can create real provider threads and may require a
+running API server. See `docs/TESTING.md` for their prerequisites and scope.
 
 ---
 
@@ -91,11 +96,10 @@ Docs live in `docs/` and the root `README.md`. Improvements, corrections, and ad
 
 ## Code Style
 
-- Python 3.9+ compatible
+- Python 3.11 through 3.14 compatible
 - Use type hints where reasonable
 - Keep functions focused and small
 - Follow existing patterns in the codebase
-- No em dashes in documentation
 
 ---
 
@@ -103,7 +107,7 @@ Docs live in `docs/` and the root `README.md`. Improvements, corrections, and ad
 
 1. **One feature per PR.** Keep changes focused.
 2. **Describe what changed** in the PR description.
-3. **Test your changes** with at least `test_phase1.py` and the relevant test scripts.
+3. **Run the deterministic checks** above. Run relevant live checks for browser-facing changes.
 4. **Don't commit sensitive data.** No `.env` files, no `browser_data/`, no cookies, no API keys.
 5. **Don't break existing functionality.** Run the test suite on at least one provider.
 
@@ -129,13 +133,18 @@ Quick reference for where to find things:
 |---|---|
 | API endpoints | `src/api/openai_routes.py`, `src/api/routes.py` |
 | OpenAI schemas | `src/api/openai_schemas.py` |
+| Durable conversation state | `src/api/conversation_store.py` |
 | ChatGPT client | `src/chatgpt/client.py` |
+| Dynamic model catalog | `src/chatgpt/model_registry.py` |
 | Claude client | `src/claude/client.py` |
 | DOM selectors | `src/selectors.py`, `src/claude/selectors.py` |
 | Browser management | `src/browser/manager.py` |
 | Configuration | `src/config.py` |
 | Docker setup | `docker/entrypoint.sh`, `docker/supervisord.conf` |
-| Tests | `scripts/test_*.py` |
+| Automated tests | `tests/` |
+| Live integration checks | `scripts/test_*.py` |
+| Manual diagnostics | `scripts/manual/` |
+| GitHub automation | `.github/workflows/` |
 | Documentation | `docs/` |
 
 ---
