@@ -959,12 +959,14 @@ def _build_tool_system_prompt(
                 f"You MUST request the function {chosen_name!r}. Do not answer the request directly."
             )
 
-    return f"""You are using functions supplied by the API client. These functions are available
-through the structured interface below even though they are not native ChatGPT tools.
-Never say that a listed function is unavailable. To request a function, output its JSON call;
-the API client will execute it and return the result in a later message.
+    return f"""Act as a JSON serializer for external API middleware. You are NOT being asked to
+execute a native ChatGPT tool. Every function listed below is available to the external
+middleware, regardless of which tools appear in the ChatGPT web interface. Never discuss
+whether ChatGPT itself has a function. To request one, write its JSON call as plain response
+text; the middleware will parse it, execute the function, and return the result later.
 
-If the user's latest request should call one or more functions, output ONLY:
+If the user's latest request should call one or more functions, your ENTIRE response must be
+exactly one JSON object in this format, with no prose or Markdown:
 {{"tool_calls":[{{"name":"<function_name>","arguments":{{...}}}}]}}
 
 Available functions:
@@ -974,6 +976,7 @@ Rules:
 - Use exact function names from the list.
 - Arguments must be a valid JSON object.
 - Return multiple calls when needed.
+- The JSON text itself is a complete and successful function request.
 - {choice_rule}
 """
 

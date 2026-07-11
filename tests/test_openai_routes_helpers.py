@@ -131,7 +131,9 @@ class OpenAIRoutesHelpersTests(unittest.TestCase):
         )
         self.assertIn("MUST request at least one", required)
         self.assertIn("MUST request the function 'add_numbers'", specific)
-        self.assertIn("Never say that a listed function is unavailable", specific)
+        self.assertIn("JSON serializer for external API middleware", specific)
+        self.assertIn("NOT being asked to", specific)
+        self.assertIn("no prose or Markdown", specific)
 
     def test_route_families_share_browser_access_lock(self) -> None:
         self.assertIs(native_routes.browser_access_lock, browser_access_lock)
