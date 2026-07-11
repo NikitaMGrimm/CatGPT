@@ -1,7 +1,8 @@
 services:
   # CatGPT Gateway - Enhanced Container Mock for Chat Apps
   catgpt:
-    image: ${CATGPT_IMAGE:-ghcr.io/thebadfella/catgpt:latest}
+    image: ${CATGPT_IMAGE:-ghcr.io/nikitamgrimm/catgpt:latest}
+    pull_policy: ${CATGPT_PULL_POLICY:-build}
     build:
       context: .
       dockerfile: docker/Dockerfile
