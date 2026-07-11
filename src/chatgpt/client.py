@@ -264,6 +264,7 @@ class ChatGPTClient:
 
         elapsed_ms = int((time.time() - start_time) * 1000)
         thread_id = self._extract_thread_id()
+        self._verify_project_thread_scope(thread_id)
         audio = None
 
         if read_aloud and response_text:
@@ -1394,3 +1395,17 @@ class ChatGPTClient:
         url = self._page.url
         match = re.search(r"/c/([a-f0-9-]+)", url)
         return match.group(1) if match else ""
+
+    def _verify_project_thread_scope(self, thread_id: str) -> None:
+        """Fail closed if a configured project produces a global conversation."""
+        project_url = Config.chatgpt_project_url()
+        if not project_url or not thread_id:
+            return
+
+        current_url = (self._page.url or "").split("?", 1)[0].rstrip("/")
+        expected_prefix = project_url[: -len("/project")] + "/c/"
+        if not current_url.startswith(expected_prefix):
+            raise RuntimeError(
+                "ChatGPT created the conversation outside the configured project; "
+                f"expected a URL under {expected_prefix}, got {current_url}"
+            )

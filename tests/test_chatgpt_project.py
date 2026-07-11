@@ -75,6 +75,19 @@ class ChatGPTProjectTests(unittest.IsolatedAsyncioTestCase):
             ["https://chatgpt.com/g/g-p-example-catgpt/c/abc-123"],
         )
 
+    def test_project_thread_scope_accepts_project_conversation(self) -> None:
+        page = _ProjectPage("https://chatgpt.com/g/g-p-example-catgpt/c/abc-123")
+        client = ChatGPTClient(page)  # type: ignore[arg-type]
+        with patch.object(Config, "CHATGPT_PROJECT_URL", PROJECT_URL):
+            client._verify_project_thread_scope("abc-123")
+
+    def test_project_thread_scope_rejects_global_conversation(self) -> None:
+        page = _ProjectPage("https://chatgpt.com/c/abc-123")
+        client = ChatGPTClient(page)  # type: ignore[arg-type]
+        with patch.object(Config, "CHATGPT_PROJECT_URL", PROJECT_URL):
+            with self.assertRaisesRegex(RuntimeError, "outside the configured project"):
+                client._verify_project_thread_scope("abc-123")
+
 
 if __name__ == "__main__":
     unittest.main()
