@@ -49,6 +49,7 @@ if "playwright_stealth" not in sys.modules:
 from src.api.openai_routes import (
     _build_page_extraction_note,
     _build_page_extraction_response_format,
+    _apply_tool_prompt_to_messages,
     _build_tool_system_prompt,
     _chat_completion_sse_chunk,
     _detect_user_prefix_contract,
@@ -129,11 +130,22 @@ class OpenAIRoutesHelpersTests(unittest.TestCase):
             tools,
             {"type": "function", "function": {"name": "add_numbers"}},
         )
-        self.assertIn("MUST select at least one", required)
-        self.assertIn("MUST select the action 'add_numbers'", specific)
-        self.assertIn("JSON serializer for an external workflow engine", specific)
-        self.assertIn("not ChatGPT capabilities", specific)
+        self.assertIn("MUST contain at least one", required)
+        self.assertIn("JSON name value MUST be 'add_numbers'", specific)
+        self.assertIn("JSON data document", specific)
+        self.assertIn("only text transformation", specific)
         self.assertIn("no prose or Markdown", specific)
+
+    def test_tool_prompt_prefixes_latest_text_user_turn(self) -> None:
+        messages = [
+            ChatMessage(role="assistant", content="Earlier answer"),
+            ChatMessage(role="user", content="Call add_numbers"),
+        ]
+        updated = _apply_tool_prompt_to_messages(messages, "Return JSON")
+        self.assertEqual(updated[0], messages[0])
+        self.assertIn("Return JSON", updated[1].content)
+        self.assertIn("Latest request to transform:\nCall add_numbers", updated[1].content)
+        self.assertEqual(messages[1].content, "Call add_numbers")
 
     def test_route_families_share_browser_access_lock(self) -> None:
         self.assertIs(native_routes.browser_access_lock, browser_access_lock)

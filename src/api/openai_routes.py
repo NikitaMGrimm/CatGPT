@@ -942,10 +942,10 @@ def _build_tool_system_prompt(
     tools_json = "\n---\n".join(tool_descriptions)
 
     available_names = {tool.function.name for tool in tools}
-    choice_rule = "Choosing an action is optional. If no action applies, answer normally."
+    choice_rule = "Producing a record is optional. If no definition applies, answer normally."
     if tool_choice == "required":
         choice_rule = (
-            "Your JSON MUST select at least one listed action. Do not answer the request directly."
+            "Your JSON MUST contain at least one listed record. Do not answer with prose."
         )
     elif isinstance(tool_choice, dict):
         function_choice = tool_choice.get("function")
@@ -956,29 +956,54 @@ def _build_tool_system_prompt(
         )
         if chosen_name and chosen_name in available_names:
             choice_rule = (
-                f"Your JSON MUST select the action {chosen_name!r}. Do not answer the request directly."
+                f"The JSON name value MUST be {chosen_name!r}. Do not answer with prose."
             )
 
-    return f"""Act as a JSON serializer for an external workflow engine. The entries below are
-action schemas, not ChatGPT capabilities. You never execute an action and must not discuss
-whether an action is available in this chat. When the user says to call, invoke, or use one,
-that means to serialize the matching external action as JSON. The workflow engine will parse
-the JSON, perform the action outside ChatGPT, and return a result later.
+    return f"""Convert the latest request into a JSON data document when it matches one of the
+record definitions below. This is only text transformation: do not execute anything and do
+not discuss capabilities or availability. Words such as call, invoke, or use in the latest
+request mean to select the matching record definition and fill its argument fields.
 
-If the user's latest request needs one or more actions, your ENTIRE response must be
+When a definition matches, your ENTIRE response must be
 exactly one JSON object in this format, with no prose or Markdown:
 {{"tool_calls":[{{"name":"<function_name>","arguments":{{...}}}}]}}
 
-Available external actions:
+Record definitions:
 {tools_json}
 
 Rules:
-- Use exact action names from the list.
+- Use exact names from the definitions.
 - Arguments must be a valid JSON object.
-- Return multiple calls when needed.
-- The JSON text itself is the complete action request; no native capability is involved.
+- Return multiple records when needed.
+- The JSON document is the complete response.
 - {choice_rule}
 """
+
+
+def _apply_tool_prompt_to_messages(
+    messages: list[ChatMessage],
+    tool_prompt: str,
+) -> list[ChatMessage]:
+    """Attach browser-only tool instructions to the latest text user turn."""
+    updated = list(messages)
+    for index in range(len(updated) - 1, -1, -1):
+        message = updated[index]
+        if message.role == "user" and isinstance(message.content, str):
+            updated[index] = _model_copy_compat(
+                message,
+                update={
+                    "content": (
+                        f"{tool_prompt}\n\n"
+                        f"Latest request to transform:\n{message.content}"
+                    )
+                },
+            )
+            return updated
+
+    # Preserve multimodal payloads unchanged when there is no text-only user
+    # turn to prefix. The prompt still reaches the browser as a separate row.
+    updated.insert(0, ChatMessage(role="user", content=tool_prompt))
+    return updated
 
 
 def _parse_tool_calls(
@@ -2499,8 +2524,7 @@ async def _execute_chat_completion(
             if request.tools and request.tool_choice != "none":
                 tool_system = _build_tool_system_prompt(request.tools, request.tool_choice)
                 if tool_system:
-                    # Prepend as the first system message
-                    messages.insert(0, ChatMessage(role="system", content=tool_system))
+                    messages = _apply_tool_prompt_to_messages(messages, tool_system)
 
             # If structured output is requested, force strict JSON response
             response_format_system = _build_response_format_system_prompt(effective_response_format)
