@@ -55,6 +55,7 @@ from src.api.openai_routes import (
     _detect_user_prefix_contract,
     _display_app_name,
     _derive_app_key,
+    _fresh_thread_from_header,
     _infer_expected_item_count,
     _looks_like_instruction_prefix,
     _merge_header_rows_in_array,
@@ -119,6 +120,31 @@ async def _collect_stream(stream_response) -> list[bytes]:
 
 
 class OpenAIRoutesHelpersTests(unittest.TestCase):
+    def test_fresh_thread_header_accepts_only_fresh(self) -> None:
+        self.assertTrue(
+            _fresh_thread_from_header(
+                _make_request({"x-catgpt-thread-mode": " Fresh "})
+            )
+        )
+        self.assertFalse(_fresh_thread_from_header(_make_request()))
+
+        with self.assertRaises(HTTPException) as ctx:
+            _fresh_thread_from_header(
+                _make_request({"x-catgpt-thread-mode": "sticky"})
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_fresh_thread_rejects_durable_routing_fields(self) -> None:
+        for field in ("conversation_id", "thread_id"):
+            req = ChatCompletionRequest(
+                messages=[ChatMessage(role="user", content="hello")],
+                **{field: "durable-route"},
+            )
+            with self.subTest(field=field), self.assertRaises(HTTPException) as ctx:
+                _validate_chat_request(req, fresh_thread=True)
+            self.assertEqual(ctx.exception.status_code, 400)
+            self.assertIn("cannot be combined", ctx.exception.detail)
+
     def test_tool_prompt_honors_none_choice(self) -> None:
         tools = [ToolDefinition(function=FunctionDefinition(name="add_numbers"))]
         self.assertEqual(_build_tool_system_prompt(tools, "none"), "")

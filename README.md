@@ -339,6 +339,27 @@ starts a fresh browser thread, preventing two unrelated stories from being
 mixed. A single new user message with a conversation id is treated as a delta.
 The ledger is partitioned by ChatGPT project, app route, and conversation id.
 
+### Stateless fresh browser threads
+
+Clients that already send a complete Chat Completions history on every request
+can require a new project-scoped ChatGPT thread for each API call:
+
+```http
+X-CatGPT-Thread-Mode: fresh
+```
+
+Fresh mode sends the complete current request once, returns the response, and
+does not save a conversation route, app-thread mapping, response-cache entry,
+or thread-contract entry. The ChatGPT thread remains visible in the configured
+project, but CatGPT forgets its thread id after the request. This is useful for
+stateless agent clients whose `tools` catalog is request metadata: converting
+that catalog into browser text once per fresh thread avoids accumulating a
+duplicate catalog on every turn of one browser conversation.
+
+`fresh` cannot be combined with `conversation_id` or `thread_id`. Durable
+conversation routing remains the better choice for callers that send true
+single-turn deltas.
+
 ### Async job
 
 ```bash
@@ -387,6 +408,10 @@ namespace, not a conversation identity: use `conversation_id`, `conversation`,
 or `previous_response_id` when an app has multiple chats. If
 `CHATGPT_PROJECT_URL` is configured, new threads are created in that project and
 mapped threads are reopened only through project-scoped URLs.
+
+An app-scoped route may still use `X-CatGPT-Thread-Mode: fresh`; fresh mode
+takes precedence over the app-level sticky fallback for that request and does
+not update the app mapping.
 
 ### Useful things to run through CatGPT
 

@@ -250,6 +250,64 @@ class TestMaybeDeleteExpiredAppThreads(unittest.TestCase):
 class TestAppThreadDeletionOrdering(unittest.TestCase):
     """Regression tests for browser lock and cleanup scheduling order."""
 
+    def test_fresh_thread_requests_never_reuse_or_save_app_mapping(self):
+        routes = _fresh_openai_routes()
+        from src.api.openai_schemas import ChatCompletionRequest, ChatMessage
+        from src.config import Config
+
+        routes._app_threads.clear()
+        routes._response_cache.clear()
+        routes._thread_contracts.clear()
+        request = ChatCompletionRequest(
+            model="catgpt-browser",
+            messages=[ChatMessage(role="user", content="complete history")],
+        )
+
+        class FakeClient:
+            def __init__(self):
+                self.new_chat_calls = 0
+                self.thread_id = "old-thread"
+
+            def _extract_thread_id(self):
+                return self.thread_id
+
+            async def new_chat(self):
+                self.new_chat_calls += 1
+                self.thread_id = ""
+
+            async def send_message(self, *_args, **_kwargs):
+                self.thread_id = f"fresh-thread-{self.new_chat_calls}"
+                return SimpleNamespace(message="ok", thread_id=self.thread_id, audio=None)
+
+        client = FakeClient()
+
+        async def run_requests():
+            with unittest.mock.patch.object(Config, "API_APP_THREAD_MODE", True, create=True), \
+                 unittest.mock.patch.object(Config, "API_THREAD_CONTRACT_MODE", True, create=True), \
+                 unittest.mock.patch.object(routes, "_get_client", return_value=client), \
+                 unittest.mock.patch.object(routes, "_lookup_thread_title", new=unittest.mock.AsyncMock(return_value="")):
+                first = await routes._execute_chat_completion(
+                    request,
+                    app_key_override="endpoint:hermes",
+                    fresh_thread=True,
+                )
+                first_thread = client.thread_id
+                second = await routes._execute_chat_completion(
+                    request,
+                    app_key_override="endpoint:hermes",
+                    fresh_thread=True,
+                )
+                return first, first_thread, second, client.thread_id
+
+        first, first_thread, second, second_thread = asyncio.run(run_requests())
+
+        self.assertEqual("ok", first.choices[0].message.content)
+        self.assertEqual("ok", second.choices[0].message.content)
+        self.assertEqual(2, client.new_chat_calls)
+        self.assertNotEqual(first_thread, second_thread)
+        self.assertNotIn("endpoint:hermes", routes._app_threads)
+        self.assertFalse(routes._thread_contracts)
+
     def test_send_message_runs_inside_browser_lock_and_cleanup_is_deferred(self):
         routes = _fresh_openai_routes()
         from src.api.openai_schemas import ChatCompletionRequest, ChatMessage

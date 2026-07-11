@@ -99,6 +99,13 @@ For durable routing, prefer `conversation_id` over `thread_id`. CatGPT stores th
 logical id, verifies full-history prefixes when supplied, and forwards only the
 new suffix. A changed or rewound history branches to a fresh ChatGPT thread.
 
+Stateless clients may send `X-CatGPT-Thread-Mode: fresh`. CatGPT then starts a
+new ChatGPT project thread for that request, submits the complete supplied
+history, and saves no durable or in-memory thread mapping. The created ChatGPT
+thread remains in the project. The only supported header value is `fresh`, and
+it cannot be combined with `conversation_id`, `X-CatGPT-Conversation-ID`, or
+`thread_id`.
+
 **Response:**
 
 ```json

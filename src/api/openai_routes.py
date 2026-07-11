@@ -126,6 +126,7 @@ _APP_KEY_HEADERS = (
     "x-requested-with",
 )
 _CONVERSATION_ID_HEADER = "x-catgpt-conversation-id"
+_THREAD_MODE_HEADER = "x-catgpt-thread-mode"
 _THREAD_TITLE_TTL_SECONDS = 600
 _thread_title_lock = asyncio.Lock()
 _thread_titles: dict[str, tuple[float, str]] = {}
@@ -1548,7 +1549,11 @@ def _build_cardinality_retry_prompt(
     )
 
 
-def _validate_chat_request(request: ChatCompletionRequest) -> None:
+def _validate_chat_request(
+    request: ChatCompletionRequest,
+    *,
+    fresh_thread: bool = False,
+) -> None:
     """Shared validation for chat completion request payloads."""
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages array cannot be empty")
@@ -1557,6 +1562,15 @@ def _validate_chat_request(request: ChatCompletionRequest) -> None:
         raise HTTPException(
             status_code=400,
             detail="thread_id and conversation_id cannot be used together",
+        )
+
+    if fresh_thread and (request.thread_id or request.conversation_id):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "X-CatGPT-Thread-Mode: fresh cannot be combined with "
+                "thread_id or conversation_id"
+            ),
         )
 
     if request.conversation_id:
@@ -1591,6 +1605,19 @@ def _apply_conversation_header(
     if not header_id or request.conversation_id:
         return request
     return _model_copy_compat(request, update={"conversation_id": header_id})
+
+
+def _fresh_thread_from_header(http_request: Request) -> bool:
+    """Return whether this stateless request must use a new browser thread."""
+    value = (http_request.headers.get(_THREAD_MODE_HEADER) or "").strip().lower()
+    if not value:
+        return False
+    if value != "fresh":
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported X-CatGPT-Thread-Mode. Supported value: fresh",
+        )
+    return True
 
 
 def _resolve_app_key(
@@ -1829,11 +1856,20 @@ async def create_chat_completion(
     Supports tool/function calling via prompt injection.
     """
     request = _apply_conversation_header(request, http_request)
-    _validate_chat_request(request)
+    fresh_thread = _fresh_thread_from_header(http_request)
+    _validate_chat_request(request, fresh_thread=fresh_thread)
     app_key = _resolve_app_key(request, http_request)
     if request.stream:
-        return await _stream_chat_completion(request, app_key_override=app_key)
-    return await _execute_chat_completion(request, app_key_override=app_key)
+        return await _stream_chat_completion(
+            request,
+            app_key_override=app_key,
+            fresh_thread=fresh_thread,
+        )
+    return await _execute_chat_completion(
+        request,
+        app_key_override=app_key,
+        fresh_thread=fresh_thread,
+    )
 
 
 
@@ -1876,11 +1912,20 @@ async def create_chat_completion_scoped(
 ) -> ChatCompletionResponse:
     """App-scoped alias for chat completions (maps app name from URL path)."""
     request = _apply_conversation_header(request, http_request)
-    _validate_chat_request(request)
+    fresh_thread = _fresh_thread_from_header(http_request)
+    _validate_chat_request(request, fresh_thread=fresh_thread)
     app_key = _resolve_app_key(request, http_request, endpoint_app_name=app_name)
     if request.stream:
-        return await _stream_chat_completion(request, app_key_override=app_key)
-    return await _execute_chat_completion(request, app_key_override=app_key)
+        return await _stream_chat_completion(
+            request,
+            app_key_override=app_key,
+            fresh_thread=fresh_thread,
+        )
+    return await _execute_chat_completion(
+        request,
+        app_key_override=app_key,
+        fresh_thread=fresh_thread,
+    )
 
 
 
@@ -2038,6 +2083,7 @@ def _chat_completion_sse_chunk(
 async def _stream_chat_completion(
     request: ChatCompletionRequest,
     app_key_override: str = "",
+    fresh_thread: bool = False,
 ) -> StreamingResponse:
     """Return a Chat Completions SSE stream after the browser response completes.
 
@@ -2051,6 +2097,7 @@ async def _stream_chat_completion(
         response = await _execute_chat_completion(
             non_stream_request,
             app_key_override=app_key_override,
+            fresh_thread=fresh_thread,
         )
         choice = response.choices[0]
         message = choice.message
@@ -2365,6 +2412,7 @@ async def _execute_chat_completion(
     app_key_override: str = "",
     seed_transcript: tuple[dict[str, Any], ...] | None = None,
     capture_route_outcome: bool = False,
+    fresh_thread: bool = False,
 ) -> ChatCompletionResponse:
     """Shared sync/async executor for chat completions."""
     client = _get_client()
@@ -2387,7 +2435,11 @@ async def _execute_chat_completion(
             if Config.API_APP_THREAD_MODE and app_key:
                 log.info("OpenAI app-thread key: %s", app_key)
 
-            if explicit_thread_id:
+            if fresh_thread:
+                await client.new_chat()
+                routing_action = "new-chat-fresh-request"
+                app_thread_created_by_catgpt = True
+            elif explicit_thread_id:
                 current_tid = client._extract_thread_id()
                 if current_tid != explicit_thread_id:
                     log.info(f"OpenAI route: navigating to explicit thread {explicit_thread_id}")
@@ -2632,7 +2684,8 @@ async def _execute_chat_completion(
 
             cache_key = _cache_key_for_request_with_app(request, app_key)
             stateful_request = bool(
-                conversation_routing
+                fresh_thread
+                or conversation_routing
                 or explicit_thread_id
                 or (Config.API_APP_THREAD_MODE and app_key)
             )
@@ -2662,7 +2715,7 @@ async def _execute_chat_completion(
                 log.error(f"ChatGPT error: {e}", exc_info=True)
                 raise HTTPException(status_code=500, detail=f"ChatGPT error: {str(e)}")
 
-            if Config.API_THREAD_CONTRACT_MODE and contract_id:
+            if not fresh_thread and Config.API_THREAD_CONTRACT_MODE and contract_id:
                 thread_for_contract = result.thread_id or current_thread_id or client._extract_thread_id()
                 if thread_for_contract:
                     async with _contract_lock:
@@ -2672,7 +2725,12 @@ async def _execute_chat_completion(
                         if user_text:
                             _thread_last_user_text[thread_for_contract] = (time.time(), user_text)
 
-            if Config.API_APP_THREAD_MODE and app_key and conversation_routing is None:
+            if (
+                not fresh_thread
+                and Config.API_APP_THREAD_MODE
+                and app_key
+                and conversation_routing is None
+            ):
                 thread_for_app = result.thread_id or client._extract_thread_id()
                 if thread_for_app:
                     post_prune_expired: list[str] = []
@@ -2878,7 +2936,12 @@ async def _execute_chat_completion(
             asyncio.create_task(_maybe_delete_expired_app_threads(_deletion_pending))
 
 
-async def _run_async_chat_job(job_id: str, request: ChatCompletionRequest, app_key: str = "") -> None:
+async def _run_async_chat_job(
+    job_id: str,
+    request: ChatCompletionRequest,
+    app_key: str = "",
+    fresh_thread: bool = False,
+) -> None:
     """Background runner for async chat completion jobs."""
     async with _jobs_lock:
         job = _jobs.get(job_id)
@@ -2887,7 +2950,11 @@ async def _run_async_chat_job(job_id: str, request: ChatCompletionRequest, app_k
         job.status = "running"
 
     try:
-        response = await _execute_chat_completion(request, app_key_override=app_key)
+        response = await _execute_chat_completion(
+            request,
+            app_key_override=app_key,
+            fresh_thread=fresh_thread,
+        )
         async with _jobs_lock:
             job = _jobs.get(job_id)
             if job is not None:
@@ -2909,7 +2976,8 @@ async def _submit_async_chat_job(
 ) -> ChatCompletionJobResponse:
     """Shared async chat submit logic for generic and app-scoped routes."""
     request = _apply_conversation_header(request, http_request)
-    _validate_chat_request(request)
+    fresh_thread = _fresh_thread_from_header(http_request)
+    _validate_chat_request(request, fresh_thread=fresh_thread)
     _get_client()
 
     app_key = _resolve_app_key(request, http_request, endpoint_app_name=endpoint_app_name)
@@ -2925,7 +2993,7 @@ async def _submit_async_chat_job(
         _jobs[job_id] = job
         _job_app_keys[job_id] = app_key
 
-    asyncio.create_task(_run_async_chat_job(job_id, request, app_key))
+    asyncio.create_task(_run_async_chat_job(job_id, request, app_key, fresh_thread))
     return job
 
 
